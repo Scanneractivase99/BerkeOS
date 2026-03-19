@@ -1,5 +1,7 @@
 # BerkeOS
 
+![BerkeOS Banner](BerkeOS.png)
+
 > An indigenous, independent x86_64 operating system written in Rust from scratch.
 
 ![Rust](https://img.shields.io/badge/Rust-no__std-b7410e?style=flat-square)
