@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+target/
+*.iso
+*.bin
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# BerkeOS specific
+.sisyphus/
+PLANS/
+plans/
+
+# Logs
+*.log
+
+# Backup files
+*.bak
+*.backup

@@ -1,0 +1,599 @@
+// BerkeOS — berkefs.rs
+// BerkeFS — Custom Filesystem v3 (Improved)
+// Layout:
+//   Sector 0      : Superblock
+//   Sectors 1-2   : Inode table (32 × 32 bytes)
+//   Sectors 3-130 : Data blocks (128 × 512 bytes = 64 KB)
+
+use crate::ata::{read_sector, write_sector, SECTOR_SIZE};
+
+pub const BERKEFS_MAGIC: u32 = 0xBE4BEF55;
+pub const BERKEFS_VERSION: u16 = 3;
+pub const BLOCK_SIZE: usize = 512;
+pub const SUPERBLOCK_LBA: u32 = 0;
+pub const INODE_TABLE_LBA: u32 = 1;
+pub const INODE_TABLE_SECTORS: u32 = 2;
+pub const DATA_START_LBA: u32 = 3;
+pub const MAX_INODES: usize = 128;
+pub const MAX_DATA_BLOCKS: usize = 256;
+pub const MAX_NAME: usize = 60;
+pub const INODE_SIZE: usize = 32;
+
+pub const FTYPE_FREE: u8 = 0;
+pub const FTYPE_FILE: u8 = 1;
+pub const FTYPE_DIR: u8 = 2;
+
+pub const INODE_FLAG_READONLY: u16 = 0x01;
+pub const INODE_FLAG_HIDDEN: u16 = 0x02;
+pub const INODE_FLAG_SYSTEM: u16 = 0x04;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Inode {
+    pub ftype: u8,
+    pub blocks: u8,
+    pub size: u16,
+    pub block: u16,
+    pub flags: u16,
+    pub name: [u8; 20],
+    pub created: u32,
+}
+
+impl Inode {
+    pub const fn empty() -> Self {
+        Inode {
+            ftype: FTYPE_FREE,
+            blocks: 0,
+            size: 0,
+            block: 0,
+            flags: 0,
+            name: [0u8; 20],
+            created: 0,
+        }
+    }
+
+    pub fn get_name(&self) -> &[u8] {
+        let mut len = 0;
+        while len < 20 && self.name[len] != 0 {
+            len += 1;
+        }
+        &self.name[..len]
+    }
+
+    pub fn set_name_short(&mut self, name: &[u8]) {
+        self.name = [0u8; 20];
+        let n = name.len().min(19);
+        self.name[..n].copy_from_slice(&name[..n]);
+    }
+}
+
+#[repr(C)]
+pub struct Superblock {
+    pub magic: u32,
+    pub version: u16,
+    pub total_blocks: u16,
+    pub free_blocks: u16,
+    pub inode_count: u16,
+    pub label: [u8; 16],
+    pub flags: u32,
+    pub checksum: u32,
+    pub ext_names: [[u8; 30]; 32],
+}
+
+pub struct BerkeFS {
+    pub drive_id: u8,
+    pub mounted: bool,
+    pub version: u16,
+    pub inodes: [Inode; MAX_INODES],
+    pub block_used: [bool; MAX_DATA_BLOCKS],
+    pub ext_names: [[u8; 30]; MAX_INODES],
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl BerkeFS {
+    pub const fn new(drive_id: u8) -> Self {
+        BerkeFS {
+            drive_id,
+            mounted: false,
+            version: BERKEFS_VERSION,
+            inodes: [Inode::empty(); MAX_INODES],
+            block_used: [false; MAX_DATA_BLOCKS],
+            ext_names: [[0u8; 30]; MAX_INODES],
+            flags: 0,
+            checksum: 0,
+        }
+    }
+
+    /// Mark Beta RAM disk as mounted (no actual I/O needed, FS lives in RAM)
+    pub fn set_mounted(&mut self) {
+        self.mounted = true;
+        self.version = BERKEFS_VERSION;
+    }
+
+    pub fn get_full_name<'a>(&self, i: usize, buf: &'a mut [u8; 64]) -> &'a [u8] {
+        let mut len = 0;
+        for &b in self.inodes[i].get_name() {
+            if len < 63 {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        for j in 0..30 {
+            if self.ext_names[i][j] == 0 {
+                break;
+            }
+            if len < 63 {
+                buf[len] = self.ext_names[i][j];
+                len += 1;
+            }
+        }
+        &buf[..len]
+    }
+
+    fn set_full_name(&mut self, i: usize, name: &[u8]) {
+        self.inodes[i].name = [0u8; 20];
+        self.ext_names[i] = [0u8; 30];
+        let short_len = name.len().min(19);
+        self.inodes[i].name[..short_len].copy_from_slice(&name[..short_len]);
+        if name.len() > 19 {
+            let ext = &name[19..];
+            let ext_len = ext.len().min(29);
+            self.ext_names[i][..ext_len].copy_from_slice(&ext[..ext_len]);
+        }
+    }
+
+    pub fn path_exists(&self, path: &[u8]) -> bool {
+        if !self.mounted {
+            return false;
+        }
+        for i in 0..MAX_INODES {
+            if self.inodes[i].ftype == FTYPE_FREE {
+                continue;
+            }
+            let mut buf = [0u8; 64];
+            let name = self.get_full_name(i, &mut buf);
+            if name == path {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn format(&mut self, label: &[u8]) -> bool {
+        self.version = BERKEFS_VERSION;
+        self.flags = 0;
+        self.checksum = 0;
+
+        let mut sector = [0u8; SECTOR_SIZE];
+        let mb = BERKEFS_MAGIC.to_le_bytes();
+        sector[0] = mb[0];
+        sector[1] = mb[1];
+        sector[2] = mb[2];
+        sector[3] = mb[3];
+        sector[4] = (BERKEFS_VERSION & 0xFF) as u8;
+        sector[5] = (BERKEFS_VERSION >> 8) as u8;
+        sector[6] = (MAX_DATA_BLOCKS & 0xFF) as u8;
+        sector[7] = (MAX_DATA_BLOCKS >> 8) as u8;
+        sector[8] = (MAX_DATA_BLOCKS & 0xFF) as u8;
+        sector[9] = (MAX_DATA_BLOCKS >> 8) as u8;
+        sector[10] = 0;
+        sector[11] = 0;
+        let n = label.len().min(16);
+        sector[12..12 + n].copy_from_slice(&label[..n]);
+
+        if !unsafe { write_sector(self.drive_id, SUPERBLOCK_LBA, &sector) } {
+            return false;
+        }
+
+        let zero = [0u8; SECTOR_SIZE];
+        for i in 0..INODE_TABLE_SECTORS {
+            if !unsafe { write_sector(self.drive_id, INODE_TABLE_LBA + i, &zero) } {
+                return false;
+            }
+        }
+
+        for i in 0..MAX_DATA_BLOCKS as u32 {
+            if !unsafe { write_sector(self.drive_id, DATA_START_LBA + i, &zero) } {
+                return false;
+            }
+        }
+
+        self.mounted = true;
+        self.inodes = [Inode::empty(); MAX_INODES];
+        self.block_used = [false; MAX_DATA_BLOCKS];
+        self.ext_names = [[0u8; 30]; MAX_INODES];
+
+        self.save_all()
+    }
+
+    pub fn mount(&mut self) -> bool {
+        let mut sector = [0u8; SECTOR_SIZE];
+        if !unsafe { read_sector(self.drive_id, SUPERBLOCK_LBA, &mut sector) } {
+            return false;
+        }
+
+        let magic = u32::from_le_bytes([sector[0], sector[1], sector[2], sector[3]]);
+        if magic != BERKEFS_MAGIC {
+            return false;
+        }
+
+        self.version = u16::from_le_bytes([sector[4], sector[5]]);
+        self.flags = u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]);
+        self.checksum = u32::from_le_bytes([sector[40], sector[41], sector[42], sector[43]]);
+
+        let ext_offset = 44usize;
+        for i in 0..MAX_INODES {
+            let off = ext_offset + i * 30;
+            if off + 30 <= SECTOR_SIZE {
+                self.ext_names[i].copy_from_slice(&sector[off..off + 30]);
+            }
+        }
+
+        for sec in 0..INODE_TABLE_SECTORS {
+            let mut isect = [0u8; SECTOR_SIZE];
+            if !unsafe { read_sector(self.drive_id, INODE_TABLE_LBA + sec, &mut isect) } {
+                return false;
+            }
+
+            let inode_start = ((sec as usize) * SECTOR_SIZE / INODE_SIZE) as usize;
+            let inode_end =
+                (((sec + 1) as usize) * SECTOR_SIZE / INODE_SIZE).min(MAX_INODES) as usize;
+
+            for i in inode_start..inode_end {
+                let off = (i - inode_start) * INODE_SIZE;
+                self.inodes[i].ftype = isect[off];
+                self.inodes[i].blocks = isect[off + 1];
+                self.inodes[i].size = u16::from_le_bytes([isect[off + 2], isect[off + 3]]);
+                self.inodes[i].block = u16::from_le_bytes([isect[off + 4], isect[off + 5]]);
+                self.inodes[i].flags = u16::from_le_bytes([isect[off + 6], isect[off + 7]]);
+                self.inodes[i].name = [0u8; 20];
+                self.inodes[i]
+                    .name
+                    .copy_from_slice(&isect[off + 8..off + 28]);
+                self.inodes[i].created = u32::from_le_bytes([
+                    isect[off + 28],
+                    isect[off + 29],
+                    isect[off + 30],
+                    isect[off + 31],
+                ]);
+            }
+        }
+
+        self.block_used = [false; MAX_DATA_BLOCKS];
+        for i in 0..MAX_INODES {
+            if self.inodes[i].ftype != FTYPE_FREE {
+                let start = self.inodes[i].block as usize;
+                let count = self.inodes[i].blocks as usize;
+                for b in start..start + count {
+                    if b < MAX_DATA_BLOCKS {
+                        self.block_used[b] = true;
+                    }
+                }
+            }
+        }
+
+        self.mounted = true;
+        true
+    }
+
+    fn save_all(&self) -> bool {
+        self.save_superblock() && self.save_inodes()
+    }
+
+    fn save_superblock(&self) -> bool {
+        let mut sector = [0u8; SECTOR_SIZE];
+        let mb = BERKEFS_MAGIC.to_le_bytes();
+        sector[0] = mb[0];
+        sector[1] = mb[1];
+        sector[2] = mb[2];
+        sector[3] = mb[3];
+        sector[4] = (self.version & 0xFF) as u8;
+        sector[5] = (self.version >> 8) as u8;
+        sector[6] = (MAX_DATA_BLOCKS & 0xFF) as u8;
+        sector[7] = (MAX_DATA_BLOCKS >> 8) as u8;
+        let free = self.free_blocks() as u8;
+        sector[8] = free;
+        sector[9] = 0;
+        let used = self.used_inodes() as u8;
+        sector[10] = used;
+        sector[11] = 0;
+
+        let flags_bytes = self.flags.to_le_bytes();
+        sector[36] = flags_bytes[0];
+        sector[37] = flags_bytes[1];
+        sector[38] = flags_bytes[2];
+        sector[39] = flags_bytes[3];
+
+        let chk_bytes = self.checksum.to_le_bytes();
+        sector[40] = chk_bytes[0];
+        sector[41] = chk_bytes[1];
+        sector[42] = chk_bytes[2];
+        sector[43] = chk_bytes[3];
+
+        let ext_offset = 44usize;
+        for i in 0..MAX_INODES {
+            let off = ext_offset + i * 30;
+            if off + 30 <= SECTOR_SIZE {
+                sector[off..off + 30].copy_from_slice(&self.ext_names[i]);
+            }
+        }
+        unsafe { write_sector(self.drive_id, SUPERBLOCK_LBA, &sector) }
+    }
+
+    pub fn save_inodes(&self) -> bool {
+        for sec in 0..INODE_TABLE_SECTORS {
+            let mut sector = [0u8; SECTOR_SIZE];
+            let inode_start = ((sec as usize) * SECTOR_SIZE / INODE_SIZE) as usize;
+            let inode_end =
+                (((sec + 1) as usize) * SECTOR_SIZE / INODE_SIZE).min(MAX_INODES) as usize;
+
+            for i in inode_start..inode_end {
+                let off = (i - inode_start) * INODE_SIZE;
+                sector[off] = self.inodes[i].ftype;
+                sector[off + 1] = self.inodes[i].blocks;
+                let size_b = self.inodes[i].size.to_le_bytes();
+                sector[off + 2] = size_b[0];
+                sector[off + 3] = size_b[1];
+                let block_b = self.inodes[i].block.to_le_bytes();
+                sector[off + 4] = block_b[0];
+                sector[off + 5] = block_b[1];
+                let flags_b = self.inodes[i].flags.to_le_bytes();
+                sector[off + 6] = flags_b[0];
+                sector[off + 7] = flags_b[1];
+                sector[off + 8..off + 28].copy_from_slice(&self.inodes[i].name);
+                let ctime_b = self.inodes[i].created.to_le_bytes();
+                sector[off + 28] = ctime_b[0];
+                sector[off + 29] = ctime_b[1];
+                sector[off + 30] = ctime_b[2];
+                sector[off + 31] = ctime_b[3];
+            }
+            if !unsafe { write_sector(self.drive_id, INODE_TABLE_LBA + sec, &sector) } {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn alloc_inode(&mut self) -> Option<usize> {
+        for i in 0..MAX_INODES {
+            if self.inodes[i].ftype == FTYPE_FREE {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn alloc_blocks(&mut self, count: usize) -> Option<usize> {
+        if count == 0 {
+            return Some(0);
+        }
+        let mut run_start = 0;
+        let mut run_len = 0;
+        for i in 0..MAX_DATA_BLOCKS {
+            if !self.block_used[i] {
+                if run_len == 0 {
+                    run_start = i;
+                }
+                run_len += 1;
+                if run_len >= count {
+                    return Some(run_start);
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+        None
+    }
+
+    pub fn create_dir(&mut self, path: &[u8]) -> bool {
+        if !self.mounted {
+            return false;
+        }
+        if self.path_exists(path) {
+            return false;
+        }
+        let idx = match self.alloc_inode() {
+            Some(i) => i,
+            None => return false,
+        };
+        self.inodes[idx].ftype = FTYPE_DIR;
+        self.inodes[idx].blocks = 0;
+        self.inodes[idx].size = 0;
+        self.inodes[idx].block = 0;
+        self.inodes[idx].flags = 0;
+        self.inodes[idx].created = 0;
+        self.set_full_name(idx, path);
+        self.save_all()
+    }
+
+    pub fn create_file(&mut self, path: &[u8], data: &[u8]) -> bool {
+        if !self.mounted {
+            return false;
+        }
+        if self.path_exists(path) {
+            return false;
+        }
+        let idx = match self.alloc_inode() {
+            Some(i) => i,
+            None => return false,
+        };
+
+        let blocks_needed = if data.is_empty() {
+            1
+        } else {
+            (data.len() + SECTOR_SIZE - 1) / SECTOR_SIZE
+        };
+        let start_block = match self.alloc_blocks(blocks_needed) {
+            Some(b) => b,
+            None => return false,
+        };
+
+        for b in 0..blocks_needed {
+            let mut sector = [0u8; SECTOR_SIZE];
+            let cs = b * SECTOR_SIZE;
+            let ce = (cs + SECTOR_SIZE).min(data.len());
+            if cs < data.len() {
+                sector[..ce - cs].copy_from_slice(&data[cs..ce]);
+            }
+            let lba = DATA_START_LBA + (start_block + b) as u32;
+            if !unsafe { write_sector(self.drive_id, lba, &sector) } {
+                return false;
+            }
+            self.block_used[start_block + b] = true;
+        }
+
+        self.inodes[idx].ftype = FTYPE_FILE;
+        self.inodes[idx].size = data.len() as u16;
+        self.inodes[idx].block = start_block as u16;
+        self.inodes[idx].blocks = blocks_needed as u8;
+        self.inodes[idx].flags = 0;
+        self.inodes[idx].created = 0;
+        self.set_full_name(idx, path);
+        self.save_all()
+    }
+
+    pub fn delete_file(&mut self, path: &[u8]) -> bool {
+        if !self.mounted {
+            return false;
+        }
+        for i in 0..MAX_INODES {
+            if self.inodes[i].ftype == FTYPE_FREE {
+                continue;
+            }
+            let mut buf = [0u8; 64];
+            let name = {
+                let mut len = 0;
+                for &b in self.inodes[i].get_name() {
+                    if len < 63 {
+                        buf[len] = b;
+                        len += 1;
+                    }
+                }
+                for j in 0..30 {
+                    if self.ext_names[i][j] == 0 {
+                        break;
+                    }
+                    if len < 63 {
+                        buf[len] = self.ext_names[i][j];
+                        len += 1;
+                    }
+                }
+                &buf[..len]
+            };
+            if name == path {
+                let start = self.inodes[i].block as usize;
+                let count = self.inodes[i].blocks as usize;
+                for b in start..start + count {
+                    if b < MAX_DATA_BLOCKS {
+                        self.block_used[b] = false;
+                    }
+                }
+                self.inodes[i] = Inode::empty();
+                self.ext_names[i] = [0u8; 30];
+                return self.save_all();
+            }
+        }
+        false
+    }
+
+    pub fn rename_entry(&mut self, old_path: &[u8], new_path: &[u8]) -> bool {
+        if !self.mounted {
+            return false;
+        }
+        for i in 0..MAX_INODES {
+            if self.inodes[i].ftype == FTYPE_FREE {
+                continue;
+            }
+            let mut buf = [0u8; 64];
+            let name_len = {
+                let mut len = 0;
+                for &b in self.inodes[i].get_name() {
+                    if len < 63 {
+                        buf[len] = b;
+                        len += 1;
+                    }
+                }
+                for j in 0..30 {
+                    if self.ext_names[i][j] == 0 {
+                        break;
+                    }
+                    if len < 63 {
+                        buf[len] = self.ext_names[i][j];
+                        len += 1;
+                    }
+                }
+                len
+            };
+            if &buf[..name_len] == old_path {
+                self.set_full_name(i, new_path);
+                return self.save_all();
+            }
+        }
+        false
+    }
+
+    pub fn read_file(&self, path: &[u8], out: &mut [u8]) -> Option<usize> {
+        if !self.mounted {
+            return None;
+        }
+        for i in 0..MAX_INODES {
+            if self.inodes[i].ftype != FTYPE_FILE {
+                continue;
+            }
+            let mut buf = [0u8; 64];
+            let name_len = {
+                let mut len = 0;
+                for &b in self.inodes[i].get_name() {
+                    if len < 63 {
+                        buf[len] = b;
+                        len += 1;
+                    }
+                }
+                for j in 0..30 {
+                    if self.ext_names[i][j] == 0 {
+                        break;
+                    }
+                    if len < 63 {
+                        buf[len] = self.ext_names[i][j];
+                        len += 1;
+                    }
+                }
+                len
+            };
+            if &buf[..name_len] != path {
+                continue;
+            }
+
+            let size = self.inodes[i].size as usize;
+            let start = self.inodes[i].block as usize;
+            let blocks = self.inodes[i].blocks as usize;
+            let mut read = 0usize;
+
+            for b in 0..blocks {
+                let mut sector = [0u8; SECTOR_SIZE];
+                let lba = DATA_START_LBA + (start + b) as u32;
+                if !unsafe { read_sector(self.drive_id, lba, &mut sector) } {
+                    return None;
+                }
+                let remaining = size - read;
+                let chunk_len = remaining.min(SECTOR_SIZE).min(out.len() - read);
+                out[read..read + chunk_len].copy_from_slice(&sector[..chunk_len]);
+                read += chunk_len;
+                if read >= size || read >= out.len() {
+                    break;
+                }
+            }
+            return Some(read);
+        }
+        None
+    }
+
+    pub fn free_blocks(&self) -> usize {
+        self.block_used.iter().filter(|&&b| !b).count()
+    }
+
+    pub fn used_inodes(&self) -> usize {
+        self.inodes.iter().filter(|i| i.ftype != FTYPE_FREE).count()
+    }
+}
