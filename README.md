@@ -178,7 +178,7 @@ __/\\\\\\\\\\\\\________________________________________________________________
 |:---|:---|
 | 🎂 **Age** | 16 years old |
 | 🌍 **Location** | Turkey 🇹🇷 |
-| 🚀 **Started** | Age 14 (2024) |
+| 🚀 **Started** | Age 8 (2018) with js |
 | 🎯 **Motivation** | Proving OS development is accessible to anyone |
 | 💰 **Cost** | 0 TL — built entirely with free AI tools |
 | 🤖 **AI Tools** | Free AI assistants for code generation & learning |
