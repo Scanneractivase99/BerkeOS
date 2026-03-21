@@ -2,10 +2,12 @@
 // Interactive shell
 
 use crate::berkefs::BerkeFS;
+use crate::bexvm;
 use crate::deno;
 use crate::font;
 use crate::framebuffer::{Color, Framebuffer};
 use crate::keyboard::{Key, Keyboard};
+use crate::serial;
 
 // ── Color palette ─────────────────────────────────────────────────────────────
 fn col_bg() -> Color {
@@ -936,6 +938,7 @@ impl Shell {
             b"calc" => self.cmd_calc(arg_slice),
             b"df" => self.cmd_df(fs),
             b"deno" | b"edit" | b"nano" => self.cmd_editor(arg_slice, fs, fb),
+            b"berun" | b"run" | b"bex" => self.cmd_berun(arg_slice, fs),
             b"img" => self.cmd_img(arg_slice),
             b"video" => self.cmd_video(arg_slice),
             b"doom" => self.cmd_doom(),
@@ -1080,6 +1083,10 @@ impl Shell {
 
         self.println("  [EDITOR]", LineColor::Gold);
         self.println("  deno <file>   - Deno Text Editor", LineColor::Normal);
+        self.println(
+            "  berun <prog>  - Run .bex bytecode program",
+            LineColor::Normal,
+        );
         self.empty_line();
 
         self.println("  [SYSTEM]", LineColor::Gold);
@@ -3656,6 +3663,99 @@ impl Shell {
             self.println("  Examples:", LineColor::Gold);
             self.println("    py print('Hello World')", LineColor::Normal);
             self.println("    py for i in range(3):", LineColor::Normal);
+        }
+        self.empty_line();
+    }
+
+    fn cmd_berun(&mut self, arg: &[u8], fs: &mut BerkeFS) {
+        self.empty_line();
+        self.println(
+            "  +==========================================+",
+            LineColor::Info,
+        );
+        self.println(
+            "  |  BerkeBex Runtime v0.1                |",
+            LineColor::Info,
+        );
+        self.println(
+            "  +==========================================+",
+            LineColor::Info,
+        );
+        self.empty_line();
+
+        if arg.is_empty() {
+            self.println("  Usage: berun <program.bex>", LineColor::Info);
+            self.println("  Run a .bex bytecode program", LineColor::Normal);
+            self.empty_line();
+            self.println("  Example:", LineColor::Gold);
+            self.println("    berun hello.bex", LineColor::Normal);
+            self.println("    deno hello.bepy  (to create .bex)", LineColor::Normal);
+            self.empty_line();
+            return;
+        }
+
+        let mut filename = [0u8; 64];
+        let mut fn_len = 0;
+        for &b in arg {
+            if b == b' ' || b == b'\t' || fn_len >= 63 {
+                break;
+            }
+            filename[fn_len] = b;
+            fn_len += 1;
+        }
+
+        let mut data = [0u8; 8192];
+        let size = fs.read_file(&filename[..fn_len], &mut data);
+
+        match size {
+            Some(file_size) if file_size > 0 => {
+                let mut msg = [0u8; 80];
+                let pfx = b"  Running: ";
+                msg[..pfx.len()].copy_from_slice(pfx);
+                let mut mi = pfx.len();
+                for i in 0..fn_len {
+                    if mi < 79 {
+                        msg[mi] = filename[i];
+                        mi += 1;
+                    }
+                }
+                self.push_line(&msg[..mi], LineColor::Success);
+
+                serial::write_str("\r\n[BERUN] Executing .bex...\r\n");
+
+                match crate::bexvm::run_bex_file(&data[..file_size]) {
+                    Ok(()) => {
+                        self.println("  [OK] Program finished", LineColor::Success);
+                    }
+                    Err(e) => {
+                        let mut err_msg = [0u8; 80];
+                        let pfx = b"  [ERROR] ";
+                        err_msg[..pfx.len()].copy_from_slice(pfx);
+                        let mut mi = pfx.len();
+                        for &b in e.as_bytes() {
+                            if mi < 79 {
+                                err_msg[mi] = b;
+                                mi += 1;
+                            }
+                        }
+                        self.push_line(&err_msg[..mi], LineColor::Error);
+                    }
+                }
+            }
+            _ => {
+                let mut err_msg = [0u8; 80];
+                let pfx = b"  [ERROR] File not found: ";
+                err_msg[..pfx.len()].copy_from_slice(pfx);
+                let mut mi = pfx.len();
+                for i in 0..fn_len {
+                    if mi < 79 {
+                        err_msg[mi] = filename[i];
+                        mi += 1;
+                    }
+                }
+                self.push_line(&err_msg[..mi], LineColor::Error);
+                self.println("  Create with: deno <filename>", LineColor::Info);
+            }
         }
         self.empty_line();
     }
