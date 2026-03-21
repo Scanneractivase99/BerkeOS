@@ -123,23 +123,41 @@ step "grub.cfg ... OK (Silent Boot)"
 # ── Step 4b: EFI Boot files ───────────────────────────────────────────────
 log "Setting up EFI boot..."
 mkdir -p build/isofiles/efi64/EFI/BOOT
+mkdir -p build/isofiles/boot/grub/i386-pc
 
-# Create EFI boot entry - point to grub
 cat > build/isofiles/efi64/shell.cfg << 'EFICFG'
 \EFI\BOOT\BOOTX64.EFI
 EFICFG
 
-# Copy kernel to EFI location for direct boot (as fallback)
 cp build/berkeos.bin build/isofiles/boot/berkeos.bin
 
-# Build proper EFI-enabled ISO using grub-mkrescue
-# This creates a hybrid ISO that works in both BIOS and UEFI mode
-grub-mkrescue -o build/berkeos.iso build/isofiles --verbose 2>&1 | head -10 || true
+# Create BIOS boot image using grub-mkimage
+step "Creating BIOS boot image..."
+grub-mkimage -O i386-pc -o build/isofiles/boot/grub/i386-pc/core.img biosdisk part_msdos part_gpt iso9660 normal search search_fs_file configfile loopback test cat echo ls reboot halt multiboot2 gfxterm font loadenv true minicmd 2>&1 | head -5 || true
 
-# Fallback: if hybrid ISO fails, try with --embedded-boot for EFI
+step "Creating bootable ISO..."
+xorriso \
+    -report_about WARNINGS \
+    -dev build/berkeos.iso \
+    -volid "BERKEOS" \
+    -joliet on \
+    -rockridge on \
+    -map "$(pwd)/build/isofiles" / \
+    -boot_image any bin_catalog \
+    -boot_image any system_area="build/isofiles/boot/grub/i386-pc/boot.img" \
+    -boot_image any emul_image="build/isofiles/boot/grub/i386-pc/core.img" \
+    -boot_image any mod_path_history= \
+    -append_partition 2 0xEF "$(pwd)/build/isofiles/efi64" \
+    -boot_image any efi_path=efi64 \
+    -boot_image any next \
+    -boot_image any efi_boot_part="--efi-boot-image" \
+    -close_offline \
+    2>&1 | head -15 || true
+
 if [ ! -f build/berkeos.iso ] || [ ! -s build/berkeos.iso ]; then
-    step "Creating EFI-enabled ISO..."
-    grub-mkrescue --output=build/berkeos.iso build/isofiles 2>&1 | head -5 || true
+    step "Fallback: grub-mkrescue with mtools..."
+    export MTOOLS_SKIP_CHECK=1 MTOOLS_FAT_COMPATIBILITY=1
+    grub-mkrescue -o build/berkeos.iso build/isofiles 2>&1 | head -10 || true
 fi
 
 [ -f "build/berkeos.iso" ] || err "ISO not created."

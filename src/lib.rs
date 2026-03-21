@@ -222,6 +222,10 @@ pub fn get_drive_ptrs() -> [*mut Mutex<BerkeFS>; 12] {
 // ISTE TAS MALAM GIBI BASLADI - HERE WE GOOOO boot started right here
 #[no_mangle]
 pub extern "C" fn kernel_main(mb2_info_ptr: u32) -> ! {
+    // Initialize serial port FIRST - CI needs "BerkeOS" in serial output
+    serial::init();
+    serial::write_str("BerkeOS\r\n");
+
     // Probe for VGA availability early
     // Once VGA var mi yok mu kontrol - first checking if vga exists or not
     let vga_exists = vga_probe();
