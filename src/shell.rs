@@ -939,6 +939,7 @@ impl Shell {
             b"df" => self.cmd_df(fs),
             b"deno" | b"edit" | b"nano" => self.cmd_editor(arg_slice, fs, fb),
             b"berun" | b"run" | b"bex" => self.cmd_berun(arg_slice, fs),
+            b"snake" => self.cmd_snake(fs),
             b"img" => self.cmd_img(arg_slice),
             b"video" => self.cmd_video(arg_slice),
             b"doom" => self.cmd_doom(),
@@ -3091,26 +3092,55 @@ impl Shell {
         self.println("  The matrix has you.", LineColor::Warning);
     }
 
-    fn cmd_snake(&mut self) {
+    fn cmd_snake(&mut self, fs: &mut BerkeFS) {
         self.empty_line();
-        self.println("  SNAKE - Classic game coming soon!", LineColor::Gold);
         self.println(
-            "  ----------------------------------------",
-            LineColor::Gold,
+            "  +==========================================+",
+            LineColor::Info,
+        );
+        self.println(
+            "  |  Snake Game - BerkeBex Runtime        |",
+            LineColor::Info,
+        );
+        self.println(
+            "  +==========================================+",
+            LineColor::Info,
         );
         self.empty_line();
 
-        // ASCII snake game preview
-        self.println("       *****     ", LineColor::Success);
-        self.println("    *******  ", LineColor::Success);
-        self.println("  ********* ", LineColor::Success);
-        self.println("    ** * *** ", LineColor::Success);
-        self.println("       *****     ", LineColor::Success);
+        let filename = b"snake.bex";
+        let mut data = [0u8; 8192];
+        let size = fs.read_file(filename, &mut data);
 
+        match size {
+            Some(file_size) if file_size > 0 => {
+                serial::write_str("\r\n[SNAKE] Loading game from disk...\r\n");
+                match crate::bexvm::run_bex_file(&data[..file_size]) {
+                    Ok(()) => {
+                        self.println("  [OK] Game finished!", LineColor::Success);
+                    }
+                    Err(e) => {
+                        self.println("  [ERROR] ", LineColor::Error);
+                        let mut err_bytes = [0u8; 32];
+                        let mut ei = 0;
+                        for &b in e.as_bytes() {
+                            if ei < 32 {
+                                err_bytes[ei] = b;
+                                ei += 1;
+                            }
+                        }
+                        self.push_line(&err_bytes[..ei], LineColor::Error);
+                    }
+                }
+            }
+            _ => {
+                self.println("  Snake game not found on disk!", LineColor::Error);
+                self.empty_line();
+                self.println("  Place 'snake.bex' in the root directory", LineColor::Info);
+                self.println("  Compile with: deno snake.bepy", LineColor::Info);
+            }
+        }
         self.empty_line();
-        self.println("  Use arrow keys to control the snake.", LineColor::Info);
-        self.println("  Eat food to grow and score!", LineColor::Info);
-        self.println("  Not yet added - coming soon!", LineColor::Warning);
     }
 
     fn cmd_ascii(&mut self) {

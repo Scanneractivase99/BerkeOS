@@ -324,6 +324,47 @@ impl BexVM {
                 17 => {
                     let _ = self.pop();
                 } // POP
+                18 => {
+                    let syscall_id = i32::from_le_bytes([
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                    ]);
+                    ip += 4;
+                    match syscall_id {
+                        0 => {
+                            let _ = self.pop();
+                        }
+                        1 => {
+                            self.push(0);
+                        }
+                        2 => {
+                            let _ = self.pop();
+                            let _ = self.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                19 => {
+                    let val = self.stack[self.sp - 1];
+                    self.push(val);
+                }
+                20 => {
+                    self.push(0);
+                }
+                21 => {
+                    let _ms = self.pop();
+                }
+                22 => {
+                    use core::num::Wrapping;
+                    static mut SEED: u64 = 12345;
+                    unsafe {
+                        SEED = SEED.wrapping_mul(1103515245).wrapping_add(12345);
+                        let val = ((SEED >> 16) & 0x7FFF) as i64;
+                        self.push(val);
+                    }
+                }
                 _ => {}
             }
         }

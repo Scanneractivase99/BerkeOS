@@ -23,7 +23,6 @@ impl Instruction {
             operand: None,
         }
     }
-
     pub fn with_operand(opcode: u8, operand: i32) -> Self {
         Self {
             opcode,
@@ -51,19 +50,16 @@ impl BytecodeFunction {
             constants: Vec::new(),
         }
     }
-
     pub fn add_constant(&mut self, value: Constant) -> usize {
         let idx = self.constants.len();
         self.constants.push(value);
         idx
     }
-
     pub fn emit(&mut self, opcode: u8) -> usize {
         let pos = self.instructions.len();
         self.instructions.push(Instruction::new(opcode));
         pos
     }
-
     pub fn emit_op(&mut self, opcode: u8, operand: i32) -> usize {
         let pos = self.instructions.len();
         self.instructions
@@ -91,19 +87,16 @@ impl BytecodeModule {
             functions: Vec::new(),
         }
     }
-
     pub fn add_constant(&mut self, value: Constant) -> usize {
         let idx = self.constants.len();
         self.constants.push(value);
         idx
     }
-
     pub fn add_function(&mut self, func: BytecodeFunction) -> usize {
         let idx = self.functions.len();
         self.functions.push(func);
         idx
     }
-
     pub fn emit_bex(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.magic.to_le_bytes());
@@ -172,8 +165,13 @@ const OP_PRINTLN: u8 = 14;
 const OP_RET: u8 = 15;
 const OP_HALT: u8 = 16;
 const OP_POP: u8 = 17;
+const OP_SYSCALL: u8 = 18;
+const OP_DUP: u8 = 19;
+const OP_INPUT: u8 = 20;
+const OP_SLEEP: u8 = 21;
+const OP_RANDOM: u8 = 22;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Token {
     Number(i32),
     Float(f64),
@@ -181,13 +179,24 @@ enum Token {
     Identifier(String),
     Print,
     PrintLn,
-    Let,
-    If,
-    While,
-    Fn,
+    PrintInt,
+    PrintChar,
+    Input,
+    Sleep,
+    Len,
+    Append,
     Return,
+    If,
+    Else,
+    While,
+    For,
+    Fn,
+    Let,
     True,
     False,
+    Int,
+    Char,
+    Void,
     Plus,
     Minus,
     Star,
@@ -204,7 +213,10 @@ enum Token {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Comma,
+    Semicolon,
     Colon,
     Newline,
     Eof,
@@ -214,7 +226,6 @@ struct Lexer {
     source: Vec<char>,
     pos: usize,
 }
-
 impl Lexer {
     fn new(source: &str) -> Self {
         Self {
@@ -248,6 +259,12 @@ impl Lexer {
         if c == '\n' {
             return Token::Newline;
         }
+        if c == '/' && self.peek() == Some('/') {
+            while self.peek() != Some('\n') && self.peek() != None {
+                self.advance();
+            }
+            return self.next_token();
+        }
         if c.is_ascii_digit() {
             let mut num = String::from(c);
             while let Some(c) = self.peek() {
@@ -275,6 +292,11 @@ impl Lexer {
             }
             return Token::String(s);
         }
+        if c == '\'' {
+            let ch = self.advance().unwrap_or(' ');
+            self.advance();
+            return Token::Number(ch as i32);
+        }
         if c.is_alphabetic() || c == '_' {
             let mut ident = String::from(c);
             while let Some(c) = self.peek() {
@@ -288,13 +310,22 @@ impl Lexer {
             return match ident.as_str() {
                 "print" => Token::Print,
                 "println" => Token::PrintLn,
+                "printi" => Token::PrintInt,
+                "input" => Token::Input,
+                "sleep" => Token::Sleep,
+                "len" => Token::Len,
+                "push" => Token::Append,
                 "let" => Token::Let,
                 "if" => Token::If,
+                "else" => Token::Else,
                 "while" => Token::While,
+                "for" => Token::For,
                 "fn" => Token::Fn,
                 "return" => Token::Return,
                 "true" => Token::True,
                 "false" => Token::False,
+                "int" => Token::Int,
+                "char" => Token::Char,
                 _ => Token::Identifier(ident),
             };
         }
@@ -302,15 +333,7 @@ impl Lexer {
             '+' => Token::Plus,
             '-' => Token::Minus,
             '*' => Token::Star,
-            '/' => {
-                if self.peek() == Some('/') {
-                    while self.peek() != Some('\n') && self.peek() != None {
-                        self.advance();
-                    }
-                    return self.next_token();
-                }
-                Token::Slash
-            }
+            '/' => Token::Slash,
             '%' => Token::Percent,
             '=' => {
                 if self.peek() == Some('=') {
@@ -348,7 +371,10 @@ impl Lexer {
             ')' => Token::RParen,
             '{' => Token::LBrace,
             '}' => Token::RBrace,
+            '[' => Token::LBracket,
+            ']' => Token::RBracket,
             ',' => Token::Comma,
+            ';' => Token::Semicolon,
             ':' => Token::Colon,
             _ => Token::Identifier(String::from(c)),
         }
@@ -370,7 +396,6 @@ struct Parser {
     tokens: Vec<Token>,
     pos: usize,
 }
-
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self { tokens, pos: 0 }
@@ -429,7 +454,7 @@ impl Parser {
                 if let Token::Identifier(name) = self.advance() {
                     locals.push(name.clone());
                     self.advance();
-                    self.parse_expr(func, module)?;
+                    self.parse_expr(func, locals, module)?;
                     func.emit(OP_STORELOCAL);
                     func.emit_op(OP_PUSHLOCAL, locals.len() as i32 - 1);
                 }
@@ -437,20 +462,40 @@ impl Parser {
             Token::Print => {
                 self.advance();
                 self.advance();
-                self.parse_expr(func, module)?;
+                self.parse_expr(func, locals, module)?;
                 self.advance();
                 func.emit(OP_PRINT);
             }
             Token::PrintLn => {
                 self.advance();
                 self.advance();
-                self.parse_expr(func, module)?;
+                self.parse_expr(func, locals, module)?;
                 self.advance();
                 func.emit(OP_PRINTLN);
             }
+            Token::PrintInt => {
+                self.advance();
+                self.advance();
+                self.parse_expr(func, locals, module)?;
+                self.advance();
+                func.emit(OP_PRINT);
+            }
+            Token::Input => {
+                self.advance();
+                self.advance();
+                self.advance();
+                func.emit(OP_INPUT);
+            }
+            Token::Sleep => {
+                self.advance();
+                self.advance();
+                self.parse_expr(func, locals, module)?;
+                self.advance();
+                func.emit(OP_SLEEP);
+            }
             Token::If => {
                 self.advance();
-                self.parse_expr(func, module)?;
+                self.parse_expr(func, locals, module)?;
                 let jmp = func.emit_op(OP_JIF, 0);
                 self.skip_nl();
                 self.advance();
@@ -466,7 +511,7 @@ impl Parser {
             Token::While => {
                 self.advance();
                 let start = func.instructions.len();
-                self.parse_expr(func, module)?;
+                self.parse_expr(func, locals, module)?;
                 let jmp = func.emit_op(OP_JIF, 0);
                 self.skip_nl();
                 self.advance();
@@ -480,19 +525,53 @@ impl Parser {
                 func.emit_op(OP_JMP, start as i32);
                 func.instructions[jmp].operand = Some(func.instructions.len() as i32);
             }
+            Token::For => {
+                self.advance();
+                let var = if let Token::Identifier(n) = self.advance() {
+                    n
+                } else {
+                    return Err("Expected var".to_string());
+                };
+                self.advance();
+                self.parse_expr(func, locals, module)?;
+                locals.push(var.clone());
+                func.emit(OP_STORELOCAL);
+                let start = func.instructions.len();
+                func.emit_op(OP_PUSHLOCAL, locals.len() as i32 - 1);
+                self.advance();
+                self.parse_expr(func, locals, module)?;
+                func.emit(OP_CMP);
+                let jmp = func.emit_op(OP_JIF, 0);
+                self.skip_nl();
+                self.advance();
+                self.skip_nl();
+                while !matches!(self.current(), Token::RBrace) {
+                    self.skip_nl();
+                    self.parse_stmt(func, locals, module)?;
+                    self.skip_nl();
+                }
+                self.advance();
+                func.emit_op(OP_PUSHLOCAL, locals.len() as i32 - 1);
+                let const_idx = func.add_constant(Constant::Integer(1));
+                func.emit_op(OP_PUSH, const_idx as i32);
+                func.emit(OP_ADD);
+                func.emit(OP_STORELOCAL);
+                func.emit_op(OP_JMP, start as i32);
+                func.instructions[jmp].operand = Some(func.instructions.len() as i32);
+            }
             Token::Return => {
                 self.advance();
                 if !matches!(self.current(), Token::Newline)
                     && !matches!(self.current(), Token::RBrace)
                 {
-                    self.parse_expr(func, module)?;
+                    self.parse_expr(func, locals, module)?;
                 } else {
                     func.emit_op(OP_PUSH, module.add_constant(Constant::Integer(0)) as i32);
                 }
                 func.emit(OP_RET);
             }
             _ => {
-                self.parse_expr(func, module)?;
+                self.parse_expr(func, locals, module)?;
                 func.emit(OP_POP);
             }
         }
@@ -501,21 +580,23 @@ impl Parser {
     fn parse_expr(
         &mut self,
         func: &mut BytecodeFunction,
+        locals: &mut Vec<String>,
         module: &mut BytecodeModule,
     ) -> Result<(), String> {
-        self.parse_cmp(func, module)
+        self.parse_cmp(func, locals, module)
     }
     fn parse_cmp(
         &mut self,
         func: &mut BytecodeFunction,
+        locals: &mut Vec<String>,
         module: &mut BytecodeModule,
     ) -> Result<(), String> {
-        self.parse_term(func, module)?;
+        self.parse_term(func, locals, module)?;
         loop {
             match self.current() {
                 Token::EqEq | Token::NotEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq => {
                     self.advance();
-                    self.parse_term(func, module)?;
+                    self.parse_term(func, locals, module)?;
                     func.emit(OP_CMP);
                 }
                 _ => break,
@@ -526,19 +607,20 @@ impl Parser {
     fn parse_term(
         &mut self,
         func: &mut BytecodeFunction,
+        locals: &mut Vec<String>,
         module: &mut BytecodeModule,
     ) -> Result<(), String> {
-        self.parse_factor(func, module)?;
+        self.parse_factor(func, locals, module)?;
         loop {
             match self.current() {
                 Token::Plus => {
                     self.advance();
-                    self.parse_factor(func, module)?;
+                    self.parse_factor(func, locals, module)?;
                     func.emit(OP_ADD);
                 }
                 Token::Minus => {
                     self.advance();
-                    self.parse_factor(func, module)?;
+                    self.parse_factor(func, locals, module)?;
                     func.emit(OP_SUB);
                 }
                 _ => break,
@@ -549,24 +631,25 @@ impl Parser {
     fn parse_factor(
         &mut self,
         func: &mut BytecodeFunction,
+        locals: &mut Vec<String>,
         module: &mut BytecodeModule,
     ) -> Result<(), String> {
-        self.parse_unary(func, module)?;
+        self.parse_unary(func, locals, module)?;
         loop {
             match self.current() {
                 Token::Star => {
                     self.advance();
-                    self.parse_unary(func, module)?;
+                    self.parse_unary(func, locals, module)?;
                     func.emit(OP_MUL);
                 }
                 Token::Slash => {
                     self.advance();
-                    self.parse_unary(func, module)?;
+                    self.parse_unary(func, locals, module)?;
                     func.emit(OP_DIV);
                 }
                 Token::Percent => {
                     self.advance();
-                    self.parse_unary(func, module)?;
+                    self.parse_unary(func, locals, module)?;
                     func.emit(OP_MOD);
                 }
                 _ => break,
@@ -577,21 +660,23 @@ impl Parser {
     fn parse_unary(
         &mut self,
         func: &mut BytecodeFunction,
+        locals: &mut Vec<String>,
         module: &mut BytecodeModule,
     ) -> Result<(), String> {
         match self.current() {
             Token::Minus => {
                 self.advance();
-                self.parse_primary(func, module)?;
+                self.parse_unary(func, locals, module)?;
                 func.emit(OP_NEGATE);
             }
-            _ => self.parse_primary(func, module)?,
+            _ => self.parse_primary(func, locals, module)?,
         }
         Ok(())
     }
     fn parse_primary(
         &mut self,
         func: &mut BytecodeFunction,
+        locals: &mut Vec<String>,
         module: &mut BytecodeModule,
     ) -> Result<(), String> {
         let tok = self.advance();
@@ -614,11 +699,53 @@ impl Parser {
                     module.add_constant(Constant::Boolean(false)) as i32,
                 );
             }
-            Token::Identifier(_) => {
-                let _ = func.emit(OP_PUSHLOCAL);
+            Token::Identifier(name) => {
+                if self.current() == &Token::LParen {
+                    self.advance();
+                    let mut args = 0;
+                    while !matches!(self.current(), Token::RParen) {
+                        self.parse_expr(func, locals, module)?;
+                        args += 1;
+                        if matches!(self.current(), Token::Comma) {
+                            self.advance();
+                        }
+                    }
+                    self.advance();
+                    match name.as_str() {
+                        "input" => {
+                            func.emit(OP_INPUT);
+                        }
+                        "sleep" => {
+                            func.emit(OP_SLEEP);
+                        }
+                        "rand" => {
+                            func.emit(OP_RANDOM);
+                            func.emit(OP_PUSH);
+                            let const_idx = func.add_constant(Constant::Integer(100));
+                            func.emit_op(OP_PUSH, const_idx as i32);
+                            func.emit(OP_MOD);
+                        }
+                        "len" => {
+                            func.emit(OP_SYSCALL);
+                            func.emit_op(OP_SYSCALL, 1);
+                        }
+                        "push" => {
+                            func.emit(OP_SYSCALL);
+                            func.emit_op(OP_SYSCALL, 2);
+                        }
+                        _ => {
+                            func.emit(OP_SYSCALL);
+                            func.emit_op(OP_SYSCALL, 0);
+                        }
+                    }
+                } else if let Some(idx) = locals.iter().position(|n| n == &name) {
+                    func.emit_op(OP_PUSHLOCAL, idx as i32);
+                } else {
+                    func.emit_op(OP_PUSH, module.add_constant(Constant::Integer(0)) as i32);
+                }
             }
             Token::LParen => {
-                self.parse_expr(func, module)?;
+                self.parse_expr(func, locals, module)?;
                 self.advance();
             }
             _ => return Err(format!("Unexpected: {:?}", tok)),
@@ -627,7 +754,7 @@ impl Parser {
     }
 }
 
-pub fn compile_python(source: &str, name: &str) -> Result<BytecodeModule, String> {
+pub fn compile(source: &str, name: &str) -> Result<BytecodeModule, String> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokens();
     let mut parser = Parser::new(tokens);
@@ -644,9 +771,11 @@ pub fn compile_python(source: &str, name: &str) -> Result<BytecodeModule, String
 }
 
 fn print_usage() {
-    println!("BerkeBex - BerkeOS Executable Compiler");
-    println!("Usage: berkebex compile <input.py> [-o <output.bex>] | berkebex info <file.bex> | berkebex help");
-    println!("Languages: Python (subset) | C (planned) | Rust (planned)");
+    println!("BerkeBex v0.2 - BerkeOS Executable Compiler");
+    println!("Usage: berkebex compile <input> [-o <output.bex>]");
+    println!("       berkebex info <file.bex>");
+    println!("Languages: .bepy (Python subset) | .c (C subset)");
+    println!("Functions: print(), println(), input(), sleep(), rand()");
 }
 
 fn compile_file(input_file: &str) -> Result<Vec<u8>, String> {
@@ -660,12 +789,10 @@ fn compile_file(input_file: &str) -> Result<Vec<u8>, String> {
         .and_then(|s| s.to_str())
         .unwrap_or("program");
     match ext {
-        "py" | "bepy" => {
-            let m = compile_python(&source, name)?;
+        "py" | "bepy" | "c" | "bexs" => {
+            let m = compile(&source, name)?;
             Ok(m.emit_bex())
         }
-        "c" => Err("C not yet".to_string()),
-        "rs" => Err("Rust not yet".to_string()),
         _ => Err(format!("Unknown: {}", ext)),
     }
 }
@@ -676,16 +803,12 @@ fn print_info(file: &str) -> Result<(), String> {
         return Err("Too short".to_string());
     }
     let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     if magic != 0x42455831 {
         return Err("Invalid .bex".to_string());
     }
     let name_len = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
     let name = String::from_utf8_lossy(&bytes[8..8 + name_len]).to_string();
-    println!(
-        "Magic: 0x{:08X} | Version: {} | Name: {}",
-        magic, version, name
-    );
+    println!("Magic: 0x{:08X} | Name: {}", magic, name);
     Ok(())
 }
 

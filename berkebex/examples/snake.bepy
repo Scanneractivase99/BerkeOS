@@ -1,0 +1,25 @@
+# Snake game for BerkeOS - .bepy format
+# Simple console-based snake
+
+fn main() {
+    println("=== SNAKE ===")
+    println("Use: up, down, left, right")
+    println("Eat food to grow!")
+    println("")
+
+    let score = 0
+    let game_over = 0
+
+    while game_over == 0 {
+        println("Score: ")
+        println(score)
+        println("")
+        println("Snake is moving...")
+        sleep(500)
+    }
+
+    println("")
+    println("Game Over!")
+    println("Final Score: ")
+    println(score)
+}
