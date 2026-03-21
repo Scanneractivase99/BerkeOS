@@ -1,0 +1,12 @@
+[package]
+name = "berkebex"
+version = "0.1.0"
+edition = "2021"
+description = "BerkeOS executable compiler for Python, C, and Rust"
+authors = ["Berke Oruç"]
+
+[[bin]]
+name = "berkebex"
+path = "src/main.rs"
+
+[dependencies]

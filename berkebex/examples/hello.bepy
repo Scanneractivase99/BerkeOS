@@ -1,0 +1,6 @@
+# BerkeBex Example - Hello World
+
+fn main() {
+    println("Hello, BerkeOS!")
+    println("Welcome to .bex runtime!")
+}

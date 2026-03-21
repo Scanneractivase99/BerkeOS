@@ -1,0 +1,13 @@
+# BerkeBex Example - Simple Calculator
+
+fn main() {
+    let a = 10
+    let b = 20
+    
+    println("Calculator Demo")
+    println("a + b = ")
+    println(a + b)
+    
+    println("a * b = ")
+    println(a * b)
+}
