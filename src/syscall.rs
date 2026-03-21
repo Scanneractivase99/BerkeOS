@@ -113,7 +113,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64) -> SyscallResult {
                 let n = path.len().min(63);
                 path_buf[..n].copy_from_slice(&path[..n]);
 
-                let fs = &mut *(&raw mut crate::FS0);
+                let fs = unsafe { &mut *crate::get_drive_ptrs()[0] };
                 let result = fs.lock().create_file(&path_buf, &[]);
                 if result {
                     for fd in 3..10 {
@@ -136,7 +136,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64) -> SyscallResult {
                 return SyscallResult::err(EBADF);
             }
             unsafe {
-                let fs = &*(&raw mut crate::FS0);
+                let fs = unsafe { &*crate::get_drive_ptrs()[0] };
                 let fs_lock = fs.lock();
                 if fd < fs_lock.inodes.len()
                     && fs_lock.inodes[fd].ftype == crate::berkefs::FTYPE_FILE
@@ -161,7 +161,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64) -> SyscallResult {
                 return SyscallResult::err(EBADF);
             }
             unsafe {
-                let fs = &mut *(&raw mut crate::FS0);
+                let fs = unsafe { &mut *crate::get_drive_ptrs()[0] };
                 let mut fs_lock = fs.lock();
                 if fd < fs_lock.inodes.len()
                     && fs_lock.inodes[fd].ftype == crate::berkefs::FTYPE_FILE
@@ -209,7 +209,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64) -> SyscallResult {
                 let mut path_buf = [0u8; 64];
                 let n = path.len().min(63);
                 path_buf[..n].copy_from_slice(&path[..n]);
-                let fs = &mut *(&raw mut crate::FS0);
+                let fs = unsafe { &mut *crate::get_drive_ptrs()[0] };
                 let result = fs.lock().create_dir(&path_buf);
                 if result {
                     SyscallResult::ok(0)
@@ -230,7 +230,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64) -> SyscallResult {
                 let mut path_buf = [0u8; 64];
                 let n = path.len().min(63);
                 path_buf[..n].copy_from_slice(&path[..n]);
-                let fs = &mut *(&raw mut crate::FS0);
+                let fs = unsafe { &mut *crate::get_drive_ptrs()[0] };
                 let result = fs.lock().delete_file(&path_buf);
                 if result {
                     SyscallResult::ok(0)
@@ -253,7 +253,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64) -> SyscallResult {
                 let mut path_buf = [0u8; 64];
                 let n = path.len().min(63);
                 path_buf[..n].copy_from_slice(&path[..n]);
-                let fs = &*(&raw mut crate::FS0);
+                let fs = unsafe { &*crate::get_drive_ptrs()[0] };
                 let exists = fs.lock().path_exists(&path_buf);
                 SyscallResult::ok(if exists { 1 } else { 0 })
             }

@@ -515,23 +515,24 @@ impl Shell {
     pub fn new(fb_w: usize, fb_h: usize) -> Self {
         let mut s = Shell::new_static();
         unsafe {
+            let drive_ptrs = crate::get_drive_ptrs();
             s.init(
                 fb_w,
                 fb_h,
                 false,
                 0,
-                &mut crate::FS0,
-                &mut crate::FS1,
-                &mut crate::FS2,
-                &mut crate::FS3,
-                &mut crate::FS4,
-                &mut crate::FS5,
-                &mut crate::FS6,
-                &mut crate::FS7,
-                &mut crate::FS8,
-                &mut crate::FS9,
-                &mut crate::FS10,
-                &mut crate::FS11,
+                unsafe { &mut *drive_ptrs[0] },
+                unsafe { &mut *drive_ptrs[1] },
+                unsafe { &mut *drive_ptrs[2] },
+                unsafe { &mut *drive_ptrs[3] },
+                unsafe { &mut *drive_ptrs[4] },
+                unsafe { &mut *drive_ptrs[5] },
+                unsafe { &mut *drive_ptrs[6] },
+                unsafe { &mut *drive_ptrs[7] },
+                unsafe { &mut *drive_ptrs[8] },
+                unsafe { &mut *drive_ptrs[9] },
+                unsafe { &mut *drive_ptrs[10] },
+                unsafe { &mut *drive_ptrs[11] },
             );
         }
         s
@@ -618,7 +619,7 @@ impl Shell {
         fb.draw_string(
             8,
             4,
-            core::str::from_utf8(&buf[..i]).unwrap_or("BerkeOS v0.6.2"),
+            core::str::from_utf8(&buf[..i]).unwrap_or("BerkeOS v0.6.3"),
             col_ltpnk(),
             col_dkpnk(),
         );
@@ -912,6 +913,7 @@ impl Shell {
             b"find" => self.cmd_find(arg_slice, fs),
             b"stat" => self.cmd_stat(arg_slice, fs),
             b"fsinfo" => self.cmd_fsinfo(fs),
+            b"fsck" => self.cmd_fsck(fs),
             b"format" => self.cmd_format(arg_slice, fs),
             b"mkdrive" => self.cmd_mkdrive(arg_slice),
             b"rmdrive" => self.cmd_rmdrive(arg_slice),
@@ -1052,7 +1054,7 @@ impl Shell {
     // help command - shows all available commands
     fn cmd_help(&mut self) {
         self.empty_line();
-        self.println("  BerkeOS v0.6.2", LineColor::Info);
+        self.println("  BerkeOS v0.6.3", LineColor::Info);
         self.println("  Developer: Berke Oruc", LineColor::Info);
         self.empty_line();
         self.println("  STRUCTURE: Monolithic Kernel (x86_64)", LineColor::Normal);
@@ -1951,6 +1953,75 @@ impl Shell {
                 LineColor::Normal,
             );
         }
+    }
+
+    fn cmd_fsck(&mut self, fs: &mut BerkeFS) {
+        self.empty_line();
+        self.println("  BerkeFS Filesystem Check", LineColor::Gold);
+        self.println(
+            "  ----------------------------------------------",
+            LineColor::Gold,
+        );
+
+        if !self.disk_ok {
+            self.println("  Storage device not detected", LineColor::Error);
+            return;
+        }
+
+        self.println("  Checking Alpha (drive 0)...", LineColor::Info);
+
+        let result = fs.fsck_validate(0);
+
+        if result.is_clean {
+            self.println("  Status   : FILESYSTEM OK", LineColor::Success);
+        } else {
+            self.println("  Status   : ERRORS FOUND", LineColor::Error);
+        }
+
+        if result.error_count > 0 {
+            self.empty_line();
+            self.println("  Errors:", LineColor::Error);
+            for i in 0..result.error_count as usize {
+                let off = i * 32;
+                let mut end = 0;
+                while end < 32 && result.errors[off + end] != 0 {
+                    end += 1;
+                }
+                let mut line = [b' '; 40];
+                line[0] = b' ';
+                line[1] = b'-';
+                line[2] = b' ';
+                let n = end.min(37);
+                line[3..3 + n].copy_from_slice(&result.errors[off..off + n]);
+                self.push_line(&line[..3 + n], LineColor::Error);
+            }
+        }
+
+        if result.warning_count > 0 {
+            self.empty_line();
+            self.println("  Warnings:", LineColor::Warning);
+            for i in 0..result.warning_count as usize {
+                let off = i * 32;
+                let mut end = 0;
+                while end < 32 && result.warnings[off + end] != 0 {
+                    end += 1;
+                }
+                let mut line = [b' '; 40];
+                line[0] = b' ';
+                line[1] = b'-';
+                line[2] = b' ';
+                let n = end.min(37);
+                line[3..3 + n].copy_from_slice(&result.warnings[off..off + n]);
+                self.push_line(&line[..3 + n], LineColor::Warning);
+            }
+        }
+
+        if result.error_count == 0 && result.warning_count == 0 {
+            self.empty_line();
+            self.println("  No errors or warnings found.", LineColor::Success);
+        }
+
+        self.empty_line();
     }
 
     fn cmd_format(&mut self, arg: &[u8], fs: &mut BerkeFS) {
@@ -2935,7 +3006,7 @@ impl Shell {
             "  ----------------------------------------",
             LineColor::Info,
         );
-        self.println("  OS       : BerkeOS v0.6.2", LineColor::Normal);
+        self.println("  OS       : BerkeOS v0.6.3", LineColor::Normal);
         self.println("  Arch     : x86_64 bare metal", LineColor::Normal);
         self.println("  Language : Rust nightly (no_std)", LineColor::Normal);
         self.println("  Boot     : UEFI/BIOS", LineColor::Normal);
@@ -3486,7 +3557,7 @@ impl Shell {
             "  =============================================",
             LineColor::Info,
         );
-        self.println("  BerkeOS v0.6.2 - Future Roadmap", LineColor::Info);
+        self.println("  BerkeOS v0.6.3 - Future Roadmap", LineColor::Info);
         self.println(
             "  =============================================",
             LineColor::Info,

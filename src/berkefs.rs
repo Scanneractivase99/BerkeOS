@@ -90,6 +90,57 @@ pub struct Superblock {
     pub ext_names: [[u8; 30]; 32], // uzun dosya isimleri - ilk 32 inode icin
 }
 
+/// FSCK result - filesystem consistency check report
+/// Uses fixed-size arrays instead of Vec (no_alloc requirement)
+pub struct FsckResult {
+    pub errors: [u8; 32],   // error messages (null-terminated, 32 bytes each)
+    pub error_count: u8,    // number of errors found
+    pub warnings: [u8; 32], // warning messages (null-terminated, 32 bytes each)
+    pub warning_count: u8,  // number of warnings found
+    pub is_clean: bool,     // true if no errors found
+    pub summary: [u8; 64],  // human-readable summary string
+}
+
+impl FsckResult {
+    /// Yeni bos sonuc olustur
+    pub const fn clean() -> Self {
+        FsckResult {
+            errors: [0u8; 32],
+            error_count: 0,
+            warnings: [0u8; 32],
+            warning_count: 0,
+            is_clean: true,
+            summary: [0u8; 64],
+        }
+    }
+
+    /// Hatayi ekle
+    fn add_error(&mut self, msg: &[u8]) {
+        if self.error_count < 32 {
+            let off = self.error_count as usize * 32;
+            let len = msg.len().min(31);
+            self.errors[off..off + len].copy_from_slice(&msg[..len]);
+            self.error_count += 1;
+        }
+    }
+
+    /// Uyari ekle
+    fn add_warning(&mut self, msg: &[u8]) {
+        if self.warning_count < 32 {
+            let off = self.warning_count as usize * 32;
+            let len = msg.len().min(31);
+            self.warnings[off..off + len].copy_from_slice(&msg[..len]);
+            self.warning_count += 1;
+        }
+    }
+
+    /// Ozet dizisi ayarla
+    fn set_summary(&mut self, msg: &[u8]) {
+        let len = msg.len().min(63);
+        self.summary[..len].copy_from_slice(&msg[..len]);
+    }
+}
+
 /// BerkeFS - ana filesystem yapisi
 /// Tum dosya sistemi islemleri bu struct uzerinden yapilir
 pub struct BerkeFS {
@@ -630,5 +681,147 @@ impl BerkeFS {
     /// Kullanilan inode sayisini dondur - kac dosya/dizin var?
     pub fn used_inodes(&self) -> usize {
         self.inodes.iter().filter(|i| i.ftype != FTYPE_FREE).count()
+    }
+
+    /// Filesystem consistency check - diskteki veriyi okur, yazmaz (read-only)
+    /// Butun kontroleri tek tek gezer, sorunlari raporlar
+    pub fn fsck_validate(&self, drive_id: u8) -> FsckResult {
+        let mut result = FsckResult::clean();
+
+        let mut sector = [0u8; SECTOR_SIZE];
+        if !unsafe { read_sector(drive_id, SUPERBLOCK_LBA, &mut sector) } {
+            result.is_clean = false;
+            result.add_error(b"ERR: Cannot read superblock");
+            result.set_summary(b"FSCK FAILED: Cannot read disk");
+            return result;
+        }
+
+        let magic = u32::from_le_bytes([sector[0], sector[1], sector[2], sector[3]]);
+        if magic != BERKEFS_MAGIC {
+            result.is_clean = false;
+            result.add_error(b"ERR: Bad magic number");
+        }
+
+        let version = u16::from_le_bytes([sector[4], sector[5]]);
+        if version != BERKEFS_VERSION {
+            result.is_clean = false;
+            result.add_error(b"ERR: Version mismatch");
+        }
+
+        let flags = u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]);
+        let checksum = u32::from_le_bytes([sector[40], sector[41], sector[42], sector[43]]);
+
+        if checksum != 0 {
+            let mut calc: u32 = 0;
+            for i in 0..SECTOR_SIZE {
+                if i >= 40 && i < 44 {
+                    continue;
+                }
+                calc = calc.wrapping_add(sector[i] as u32);
+            }
+            if calc != checksum {
+                result.is_clean = false;
+                result.add_error(b"ERR: Superblock checksum mismatch");
+            }
+        }
+
+        for sec in 0..INODE_TABLE_SECTORS {
+            let mut isect = [0u8; SECTOR_SIZE];
+            if !unsafe { read_sector(drive_id, INODE_TABLE_LBA + sec, &mut isect) } {
+                result.is_clean = false;
+                result.add_error(b"ERR: Cannot read inode table");
+                result.set_summary(b"FSCK FAILED: Cannot read inode table");
+                return result;
+            }
+
+            let inode_start = ((sec as usize) * SECTOR_SIZE / INODE_SIZE) as usize;
+            let inode_end =
+                (((sec + 1) as usize) * SECTOR_SIZE / INODE_SIZE).min(MAX_INODES) as usize;
+
+            for i in inode_start..inode_end {
+                let off = (i - inode_start) * INODE_SIZE;
+                let ftype = isect[off];
+                let blocks = isect[off + 1];
+                let block_lo = isect[off + 4];
+                let block_hi = isect[off + 5];
+                let block = u16::from_le_bytes([block_lo, block_hi]);
+                let size = u16::from_le_bytes([isect[off + 2], isect[off + 3]]);
+
+                if ftype == FTYPE_FREE {
+                    continue;
+                }
+
+                if ftype != FTYPE_FILE && ftype != FTYPE_DIR {
+                    result.add_warning(b"WRN: Unknown inode type");
+                }
+
+                if blocks > 0 {
+                    if block as usize >= MAX_DATA_BLOCKS {
+                        result.is_clean = false;
+                        result.add_error(b"ERR: Inode block out of bounds");
+                    } else if (block as usize) + (blocks as usize) > MAX_DATA_BLOCKS {
+                        result.is_clean = false;
+                        result.add_error(b"ERR: Inode block range overflow");
+                    }
+                }
+
+                if size > 0 && blocks == 0 {
+                    result.add_warning(b"WRN: Non-empty file with zero blocks");
+                }
+            }
+        }
+
+        let mut seen_blocks = [false; MAX_DATA_BLOCKS];
+        let mut duplicate_count: u8 = 0;
+
+        for i in 0..MAX_INODES {
+            let inode = &self.inodes[i];
+            if inode.ftype == FTYPE_FREE {
+                continue;
+            }
+
+            if inode.blocks > 0 {
+                let start = inode.block as usize;
+                let count = inode.blocks as usize;
+
+                if start < MAX_DATA_BLOCKS && count <= MAX_DATA_BLOCKS {
+                    let end = (start + count).min(MAX_DATA_BLOCKS);
+                    for b in start..end {
+                        if seen_blocks[b] {
+                            duplicate_count = duplicate_count.saturating_add(1);
+                        } else {
+                            seen_blocks[b] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if duplicate_count > 0 {
+            result.is_clean = false;
+            result.add_error(b"ERR: Duplicate block allocations");
+        }
+
+        let actual_free: usize = seen_blocks.iter().filter(|&&b| !b).count();
+        let reported_free = (sector[8] as usize) + ((sector[9] as usize) << 8);
+        if sector[8] != 0 || sector[9] != 0 {
+            if actual_free != reported_free {
+                result.add_warning(b"WRN: Free block count mismatch");
+            }
+        }
+
+        if result.is_clean {
+            let cnt = self.used_inodes();
+            let mut s = *b"FSCK CLEAN: X inodes OK   ";
+            s[13] = (b'0' as u8).wrapping_add((cnt / 100) as u8 % 10);
+            s[14] = (b'0' as u8).wrapping_add((cnt / 10) as u8 % 10);
+            s[15] = (b'0' as u8).wrapping_add((cnt % 10) as u8);
+            result.set_summary(&s);
+        } else {
+            result.set_summary(b"FSCK FOUND ERRORS - RUN RECOVERY");
+        }
+
+        let _ = flags;
+        result
     }
 }
