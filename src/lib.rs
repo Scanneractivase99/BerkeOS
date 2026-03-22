@@ -24,6 +24,7 @@ mod paging;
 mod pcspeaker;
 mod pic;
 mod pit;
+mod popup;
 mod process;
 mod rtc;
 mod rtl8139;

@@ -10,3 +10,6 @@ name = "berkebex"
 path = "src/main.rs"
 
 [dependencies]
+rustpython-parser = "0.4"
+regex = "1"
+serde_json = "1"

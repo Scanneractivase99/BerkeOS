@@ -1,10 +1,81 @@
 // BerkeOS — bexvm.rs
 // BerkeBex Virtual Machine - Execute .bex bytecode programs
 
+const MAX_BYTECODE_SIZE: usize = 65536;
+const MAX_CALL_DEPTH: usize = 64;
+const MAX_FUNC_COUNT: usize = 256;
+const MAX_ARRAYS: usize = 32;
+const MAX_ARRAY_LEN: usize = 64;
+const MAX_DICTS: usize = 32;
+const MAX_DICT_ENTRIES: usize = 32;
+const MAX_EXCEPTION_DEPTH: usize = 16;
+
+#[derive(Clone, Copy)]
+struct BexArray {
+    data: [i64; MAX_ARRAY_LEN],
+    len: usize,
+}
+
+impl BexArray {
+    fn new() -> Self {
+        Self {
+            data: [0; MAX_ARRAY_LEN],
+            len: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BexDictEntry {
+    key: [u8; 64],
+    key_len: usize,
+    value: i64,
+}
+
+impl BexDictEntry {
+    fn new() -> Self {
+        Self {
+            key: [0; 64],
+            key_len: 0,
+            value: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BexDict {
+    entries: [BexDictEntry; MAX_DICT_ENTRIES],
+    len: usize,
+}
+
+impl BexDict {
+    fn new() -> Self {
+        Self {
+            entries: [BexDictEntry::new(); MAX_DICT_ENTRIES],
+            len: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExceptionFrame {
+    handler_ip: usize,
+    stack_snapshot: usize,
+}
+
 pub struct BexVM {
     stack: [i64; 256],
     sp: usize,
     locals: [i64; 32],
+    call_stack: [(usize, [i64; 32]); MAX_CALL_DEPTH],
+    call_sp: usize,
+    arrays: [BexArray; MAX_ARRAYS],
+    array_next: usize,
+    dicts: [BexDict; MAX_DICTS],
+    dict_next: usize,
+    exception_stack: [Option<ExceptionFrame>; MAX_EXCEPTION_DEPTH],
+    exception_sp: usize,
+    current_exception: Option<i64>,
 }
 
 impl BexVM {
@@ -13,6 +84,15 @@ impl BexVM {
             stack: [0; 256],
             sp: 0,
             locals: [0; 32],
+            call_stack: [(0, [0; 32]); MAX_CALL_DEPTH],
+            call_sp: 0,
+            arrays: [BexArray::new(); MAX_ARRAYS],
+            array_next: 0,
+            dicts: [BexDict::new(); MAX_DICTS],
+            dict_next: 0,
+            exception_stack: [None; MAX_EXCEPTION_DEPTH],
+            exception_sp: 0,
+            current_exception: None,
         }
     }
 
@@ -62,7 +142,7 @@ impl BexVM {
         }
     }
 
-    fn print_const(&self, data: &[u8], offset: &mut usize) {
+    fn print_const(&self, data: &[u8], offset: &mut usize, name_len: usize) {
         let tag = data[*offset];
         *offset += 1;
         match tag {
@@ -114,6 +194,85 @@ impl BexVM {
                     self.print_str(b"false");
                 }
             }
+            5 => {
+                let count = u32::from_le_bytes([
+                    data[*offset],
+                    data[*offset + 1],
+                    data[*offset + 2],
+                    data[*offset + 3],
+                ]) as usize;
+                *offset += 4;
+                self.print_str(b"{");
+                for i in 0..count {
+                    if i > 0 {
+                        self.print_str(b", ");
+                    }
+                    let key_len = u32::from_le_bytes([
+                        data[*offset],
+                        data[*offset + 1],
+                        data[*offset + 2],
+                        data[*offset + 3],
+                    ]) as usize;
+                    *offset += 4;
+                    for j in 0..key_len {
+                        crate::serial::write_byte(data[*offset + j]);
+                    }
+                    *offset += key_len;
+                    self.print_str(b": ");
+                    let val_idx = u32::from_le_bytes([
+                        data[*offset],
+                        data[*offset + 1],
+                        data[*offset + 2],
+                        data[*offset + 3],
+                    ]) as usize;
+                    *offset += 4;
+                    let mut search_off = 8 + name_len + 4;
+                    for _ in 0..val_idx {
+                        if search_off >= data.len() {
+                            break;
+                        }
+                        let t = data[search_off];
+                        search_off += 1;
+                        match t {
+                            1 => search_off += 4,
+                            2 => search_off += 8,
+                            3 => {
+                                let l = u32::from_le_bytes([
+                                    data[search_off],
+                                    data[search_off + 1],
+                                    data[search_off + 2],
+                                    data[search_off + 3],
+                                ]) as usize;
+                                search_off += 4 + l;
+                            }
+                            4 => search_off += 1,
+                            5 => {
+                                let cnt = u32::from_le_bytes([
+                                    data[search_off],
+                                    data[search_off + 1],
+                                    data[search_off + 2],
+                                    data[search_off + 3],
+                                ]) as usize;
+                                search_off += 4;
+                                for _ in 0..cnt {
+                                    let kl = u32::from_le_bytes([
+                                        data[search_off],
+                                        data[search_off + 1],
+                                        data[search_off + 2],
+                                        data[search_off + 3],
+                                    ]) as usize;
+                                    search_off += 4 + kl + 4;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if search_off < data.len() {
+                        self.print_const(data, &mut search_off, name_len);
+                    }
+                }
+                self.print_str(b"}");
+            }
             _ => {}
         }
     }
@@ -121,6 +280,9 @@ impl BexVM {
     pub fn run(&mut self, data: &[u8]) -> Result<(), &'static str> {
         if data.len() < 8 {
             return Err("File too small");
+        }
+        if data.len() > MAX_BYTECODE_SIZE {
+            return Err("File too large");
         }
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         if magic != 0x42455831 {
@@ -166,6 +328,24 @@ impl BexVM {
                     offset += 4 + len;
                 }
                 4 => offset += 1,
+                5 => {
+                    let count = u32::from_le_bytes([
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                    ]) as usize;
+                    offset += 4;
+                    for _ in 0..count {
+                        let key_len = u32::from_le_bytes([
+                            data[offset],
+                            data[offset + 1],
+                            data[offset + 2],
+                            data[offset + 3],
+                        ]) as usize;
+                        offset += 4 + key_len + 4;
+                    }
+                }
                 _ => break,
             }
         }
@@ -178,10 +358,13 @@ impl BexVM {
         ]) as usize;
         offset += 4;
 
-        for _ in 0..func_count {
+        let mut func_addrs = [0usize; MAX_FUNC_COUNT];
+        let func_count = func_count.min(MAX_FUNC_COUNT);
+        for i in 0..func_count {
             if offset >= data.len() {
                 break;
             }
+            func_addrs[i] = offset;
             let fn_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
             offset += 2 + fn_len + 4;
             let instr_count = u32::from_le_bytes([
@@ -236,20 +419,52 @@ impl BexVM {
                                 off += 4 + l;
                             }
                             4 => off += 1,
+                            5 => {
+                                let count = u32::from_le_bytes([
+                                    data[off],
+                                    data[off + 1],
+                                    data[off + 2],
+                                    data[off + 3],
+                                ]) as usize;
+                                off += 4;
+                                for _ in 0..count {
+                                    let kl = u32::from_le_bytes([
+                                        data[off],
+                                        data[off + 1],
+                                        data[off + 2],
+                                        data[off + 3],
+                                    ]) as usize;
+                                    off += 4 + kl + 4;
+                                }
+                            }
                             _ => break,
                         }
                     }
                     if off < data.len() {
-                        self.print_const(data, &mut off);
+                        self.print_const(data, &mut off, name_len);
                     }
                 }
                 2 => {
-                    self.push(self.locals[0]);
+                    let index = i32::from_le_bytes([
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                    ]) as usize;
+                    if index < 32 {
+                        self.push(self.locals[index]);
+                    }
                 } // PUSHLOCAL
                 3 => {
+                    let index = i32::from_le_bytes([
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                    ]) as usize;
                     let v = self.pop();
-                    if self.sp < 32 {
-                        self.locals[0] = v;
+                    if index < 32 {
+                        self.locals[index] = v;
                     }
                 } // STORELOCAL
                 4 => {
@@ -318,9 +533,19 @@ impl BexVM {
                     let _ = self.pop();
                     crate::serial::write_str("\r\n");
                 } // PRINTLN
-                15 | 16 => {
+                15 => {
+                    if self.call_sp > 0 {
+                        self.call_sp -= 1;
+                        let (ret_ip, saved_locals) = self.call_stack[self.call_sp];
+                        ip = ret_ip;
+                        self.locals = saved_locals;
+                    } else {
+                        break;
+                    }
+                } // RET
+                16 => {
                     break;
-                } // RET/HALT
+                } // HALT
                 17 => {
                     let _ = self.pop();
                 } // POP
@@ -333,15 +558,35 @@ impl BexVM {
                     ]);
                     ip += 4;
                     match syscall_id {
+                        // new_array() - creates new array, returns array ref
                         0 => {
-                            let _ = self.pop();
+                            if self.array_next < MAX_ARRAYS {
+                                let arr_idx = self.array_next;
+                                self.arrays[arr_idx] = BexArray::new();
+                                self.array_next += 1;
+                                self.push(arr_idx as i64);
+                            } else {
+                                self.push(-1); // error: no space
+                            }
                         }
+                        // len() - takes array ref, returns length
                         1 => {
-                            self.push(0);
+                            let arr_idx = self.pop() as usize;
+                            if arr_idx < self.array_next {
+                                self.push(self.arrays[arr_idx].len as i64);
+                            } else {
+                                self.push(0);
+                            }
                         }
+                        // push() - takes value and array ref, appends value to array
                         2 => {
-                            let _ = self.pop();
-                            let _ = self.pop();
+                            let val = self.pop();
+                            let arr_idx = self.pop() as usize;
+                            if arr_idx < self.array_next && self.arrays[arr_idx].len < MAX_ARRAY_LEN
+                            {
+                                self.arrays[arr_idx].data[self.arrays[arr_idx].len] = val;
+                                self.arrays[arr_idx].len += 1;
+                            }
                         }
                         _ => {}
                     }
@@ -364,6 +609,232 @@ impl BexVM {
                         let val = ((SEED >> 16) & 0x7FFF) as i64;
                         self.push(val);
                     }
+                }
+                23 => {
+                    let func_idx = i32::from_le_bytes([
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                    ]) as usize;
+                    ip += 4;
+                    if func_idx < func_count && self.call_sp < MAX_CALL_DEPTH {
+                        let mut saved_locals = self.locals;
+                        core::mem::swap(&mut saved_locals, &mut self.locals);
+                        self.call_stack[self.call_sp] = (ip, saved_locals);
+                        self.call_sp += 1;
+                        ip = func_addrs[func_idx];
+                    }
+                }
+                24 => {
+                    let handler_ip = i32::from_le_bytes([
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                        data[pos + 4],
+                    ]) as usize;
+                    ip += 4;
+                    if self.exception_sp < MAX_EXCEPTION_DEPTH {
+                        self.exception_stack[self.exception_sp] = Some(ExceptionFrame {
+                            handler_ip,
+                            stack_snapshot: self.sp,
+                        });
+                        self.exception_sp += 1;
+                    }
+                }
+                25 => {
+                    if self.exception_sp > 0 {
+                        self.exception_sp -= 1;
+                        if let Some(frame) = self.exception_stack[self.exception_sp] {
+                            self.current_exception = Some(self.pop());
+                            self.sp = frame.stack_snapshot;
+                            ip = frame.handler_ip;
+                        }
+                    }
+                }
+                26 => {
+                    let msg_ptr = self.pop() as usize;
+                    let exc_type = self.pop();
+                    self.current_exception = Some((exc_type << 32) | (msg_ptr as i64));
+                    if self.exception_sp > 0 {
+                        self.exception_sp -= 1;
+                        if let Some(frame) = self.exception_stack[self.exception_sp] {
+                            self.sp = frame.stack_snapshot;
+                            ip = frame.handler_ip;
+                        }
+                    }
+                }
+                27 => {
+                    let idx = self.pop() as usize;
+                    let arr_ref = self.pop() as usize;
+                    if arr_ref < self.array_next && idx < self.arrays[arr_ref].len {
+                        self.push(self.arrays[arr_ref].data[idx]);
+                    } else {
+                        self.push(0);
+                    }
+                }
+                28 => {
+                    let val = self.pop();
+                    let idx = self.pop() as usize;
+                    let arr_ref = self.pop() as usize;
+                    if arr_ref < self.array_next && idx < MAX_ARRAY_LEN {
+                        self.arrays[arr_ref].data[idx] = val;
+                    }
+                }
+                29 => {
+                    let dict_ref = self.pop() as usize;
+                    let key_idx = self.pop() as usize;
+                    let key_off = 8 + name_len + 4;
+                    let mut off = key_off;
+                    for _ in 0..dict_ref {
+                        if off >= data.len() {
+                            break;
+                        }
+                        let t = data[off];
+                        off += 1;
+                        match t {
+                            1 => off += 4,
+                            2 => off += 8,
+                            3 => {
+                                let l = u32::from_le_bytes([
+                                    data[off],
+                                    data[off + 1],
+                                    data[off + 2],
+                                    data[off + 3],
+                                ]) as usize;
+                                off += 4 + l;
+                            }
+                            4 => off += 1,
+                            5 => {
+                                let cnt = u32::from_le_bytes([
+                                    data[off],
+                                    data[off + 1],
+                                    data[off + 2],
+                                    data[off + 3],
+                                ]) as usize;
+                                off += 4;
+                                for _ in 0..cnt {
+                                    let kl = u32::from_le_bytes([
+                                        data[off],
+                                        data[off + 1],
+                                        data[off + 2],
+                                        data[off + 3],
+                                    ]) as usize;
+                                    off += 4 + kl + 4;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    if off < data.len() && data[off] == 5 {
+                        off += 1;
+                        let count = u32::from_le_bytes([
+                            data[off],
+                            data[off + 1],
+                            data[off + 2],
+                            data[off + 3],
+                        ]) as usize;
+                        off += 4;
+                        let mut found = false;
+                        for _ in 0..count {
+                            let key_len = u32::from_le_bytes([
+                                data[off],
+                                data[off + 1],
+                                data[off + 2],
+                                data[off + 3],
+                            ]) as usize;
+                            off += 4;
+                            let mut key_bytes = [0u8; 64];
+                            for i in 0..key_len.min(64) {
+                                key_bytes[i] = data[off + i];
+                            }
+                            off += key_len;
+                            let val_idx = u32::from_le_bytes([
+                                data[off],
+                                data[off + 1],
+                                data[off + 2],
+                                data[off + 3],
+                            ]) as usize;
+                            off += 4;
+                            if key_len < 64 && dict_ref == key_idx as usize {
+                                let mut lookup_off = key_off;
+                                for _ in 0..val_idx {
+                                    if lookup_off >= data.len() {
+                                        break;
+                                    }
+                                    let lt = data[lookup_off];
+                                    lookup_off += 1;
+                                    match lt {
+                                        1 => lookup_off += 4,
+                                        2 => lookup_off += 8,
+                                        3 => {
+                                            let ll = u32::from_le_bytes([
+                                                data[lookup_off],
+                                                data[lookup_off + 1],
+                                                data[lookup_off + 2],
+                                                data[lookup_off + 3],
+                                            ])
+                                                as usize;
+                                            lookup_off += 4 + ll;
+                                        }
+                                        4 => lookup_off += 1,
+                                        5 => {
+                                            let lcnt = u32::from_le_bytes([
+                                                data[lookup_off],
+                                                data[lookup_off + 1],
+                                                data[lookup_off + 2],
+                                                data[lookup_off + 3],
+                                            ])
+                                                as usize;
+                                            lookup_off += 4;
+                                            for _ in 0..lcnt {
+                                                let lkl = u32::from_le_bytes([
+                                                    data[lookup_off],
+                                                    data[lookup_off + 1],
+                                                    data[lookup_off + 2],
+                                                    data[lookup_off + 3],
+                                                ])
+                                                    as usize;
+                                                lookup_off += 4 + lkl + 4;
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                if lookup_off < data.len() {
+                                    let tag = data[lookup_off];
+                                    lookup_off += 1;
+                                    match tag {
+                                        1 => {
+                                            let val = i32::from_le_bytes([
+                                                data[lookup_off],
+                                                data[lookup_off + 1],
+                                                data[lookup_off + 2],
+                                                data[lookup_off + 3],
+                                            ]);
+                                            self.push(val as i64);
+                                        }
+                                        4 => {
+                                            self.push(if data[lookup_off] != 0 { 1 } else { 0 });
+                                        }
+                                        _ => self.push(0),
+                                    }
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !found {
+                            self.push(0);
+                        }
+                    } else {
+                        self.push(0);
+                    }
+                }
+                30 => {
+                    let b = self.pop();
+                    let a = self.pop();
+                    self.push((a << 32) | (b & 0xFFFFFFFF));
                 }
                 _ => {}
             }

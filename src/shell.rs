@@ -939,6 +939,7 @@ impl Shell {
             b"df" => self.cmd_df(fs),
             b"deno" | b"edit" | b"nano" => self.cmd_editor(arg_slice, fs, fb),
             b"berun" | b"run" | b"bex" => self.cmd_berun(arg_slice, fs),
+            b"berkepython" | b"bpy" => self.cmd_berkepython(arg_slice, fs),
             b"snake" => self.cmd_snake(fs),
             b"img" => self.cmd_img(arg_slice),
             b"video" => self.cmd_video(arg_slice),
@@ -1086,6 +1087,10 @@ impl Shell {
         self.println("  deno <file>   - Deno Text Editor", LineColor::Normal);
         self.println(
             "  berun <prog>  - Run .bex bytecode program",
+            LineColor::Normal,
+        );
+        self.println(
+            "  berkepython   - Compile and run .py script",
             LineColor::Normal,
         );
         self.empty_line();
@@ -3979,4 +3984,313 @@ fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
         }
     }
     false
+}
+
+impl Shell {
+    fn cmd_berkepython(&mut self, arg: &[u8], fs: &mut BerkeFS) {
+        self.empty_line();
+        self.println(
+            "  +==========================================+",
+            LineColor::Info,
+        );
+        self.println(
+            "  |  BerkePython v0.1                      |",
+            LineColor::Info,
+        );
+        self.println(
+            "  +==========================================+",
+            LineColor::Info,
+        );
+        self.empty_line();
+
+        if arg.is_empty() {
+            self.println("  Usage: berkepython <script.py>", LineColor::Info);
+            self.println("  Compile and run a Python script", LineColor::Normal);
+            self.empty_line();
+            self.println("  Example:", LineColor::Gold);
+            self.println("    berkepython hello.py", LineColor::Normal);
+            self.println("    berkepython myscript.py", LineColor::Normal);
+            self.empty_line();
+            self.println("  Supported:", LineColor::Info);
+            self.println("    print(), println()", LineColor::Normal);
+            self.println("    basic expressions", LineColor::Normal);
+            self.empty_line();
+            return;
+        }
+
+        let mut filename = [0u8; 64];
+        let mut fn_len = 0;
+        for &b in arg {
+            if b == b' ' || b == b'\t' || fn_len >= 63 {
+                break;
+            }
+            filename[fn_len] = b;
+            fn_len += 1;
+        }
+
+        let mut py_source = [0u8; 8192];
+        let size = fs.read_file(&filename[..fn_len], &mut py_source);
+
+        match size {
+            Some(file_size) if file_size > 0 => {
+                let mut msg = [0u8; 80];
+                let pfx = b"  Compiling: ";
+                msg[..pfx.len()].copy_from_slice(pfx);
+                let mut mi = pfx.len();
+                for i in 0..fn_len {
+                    if mi < 79 {
+                        msg[mi] = filename[i];
+                        mi += 1;
+                    }
+                }
+                self.push_line(&msg[..mi], LineColor::Success);
+
+                serial::write_str("\r\n[BERKEPY] Compiling Python...\r\n");
+
+                let source_str = match core::str::from_utf8(&py_source[..file_size]) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        self.println("  [ERROR] Invalid UTF-8 in source file", LineColor::Error);
+                        self.empty_line();
+                        return;
+                    }
+                };
+
+                let mut bex_buf = [0u8; 4096];
+                match self.transpile_python_to_bex(source_str, &mut bex_buf) {
+                    Ok(bex_len) => {
+                        serial::write_str("[BERKEPY] Running bytecode...\r\n");
+
+                        match crate::bexvm::run_bex_file(&bex_buf[..bex_len]) {
+                            Ok(()) => {
+                                self.println("  [OK] Program finished", LineColor::Success);
+                            }
+                            Err(e) => {
+                                let mut err_msg = [0u8; 80];
+                                let pfx = b"  [RUNTIME ERROR] ";
+                                err_msg[..pfx.len()].copy_from_slice(pfx);
+                                let mut mi = pfx.len();
+                                for &b in e.as_bytes() {
+                                    if mi < 79 {
+                                        err_msg[mi] = b;
+                                        mi += 1;
+                                    }
+                                }
+                                self.push_line(&err_msg[..mi], LineColor::Error);
+                            }
+                        }
+                    }
+                    Err(_e) => {
+                        self.println("  [ERROR] Transpilation failed", LineColor::Error);
+                        self.println("  Hint: Use 'berun' for pre-compiled .bex", LineColor::Info);
+                    }
+                }
+            }
+            _ => {
+                let mut err_msg = [0u8; 80];
+                let pfx = b"  [ERROR] File not found: ";
+                err_msg[..pfx.len()].copy_from_slice(pfx);
+                let mut mi = pfx.len();
+                for i in 0..fn_len {
+                    if mi < 79 {
+                        err_msg[mi] = filename[i];
+                        mi += 1;
+                    }
+                }
+                self.push_line(&err_msg[..mi], LineColor::Error);
+                self.println("  Create .py file with 'write' or 'deno'", LineColor::Info);
+            }
+        }
+        self.empty_line();
+    }
+
+    fn transpile_python_to_bex(&self, source: &str, output: &mut [u8]) -> Result<usize, ()> {
+        const MAX_LINES: usize = 128;
+        const MAX_STRINGS: usize = 16;
+        const MAX_INSTRUCTIONS: usize = 256;
+
+        let mut pos: usize = 0;
+
+        output[pos..pos + 4].copy_from_slice(&0x42455831u32.to_le_bytes());
+        pos += 4;
+
+        output[pos..pos + 2].copy_from_slice(&1u16.to_le_bytes());
+        pos += 2;
+
+        let name = b"python_script";
+        output[pos..pos + 2].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        pos += 2;
+        output[pos..pos + name.len()].copy_from_slice(name);
+        pos += name.len();
+
+        let mut lines_buf = [[0u8; 128]; MAX_LINES];
+        let mut line_lens = [0usize; MAX_LINES];
+        let mut line_count = 0;
+
+        let mut line_start = 0;
+        let mut in_line = false;
+        for (i, &b) in source.as_bytes().iter().enumerate() {
+            if b == b'\n' || i == source.len() - 1 {
+                if in_line || b == b'\n' {
+                    let end = if i == source.len() - 1 { i + 1 } else { i };
+                    let len = (end - line_start).min(127);
+                    if line_count < MAX_LINES && len > 0 {
+                        lines_buf[line_count][..len]
+                            .copy_from_slice(&source.as_bytes()[line_start..line_start + len]);
+                        line_lens[line_count] = len;
+                        line_count += 1;
+                    }
+                }
+                line_start = i + 1;
+                in_line = false;
+            } else if b != b' ' && b != b'\t' && b != b'\r' {
+                in_line = true;
+            }
+        }
+
+        let mut strings_buf = [[0u8; 64]; MAX_STRINGS];
+        let mut string_lens = [0usize; MAX_STRINGS];
+        let mut string_count = 0;
+
+        for li in 0..line_count {
+            let line = &lines_buf[li][..line_lens[li]];
+            let mut i = 0;
+            while i < line.len() {
+                if line[i] == b'"' || line[i] == b'\'' {
+                    let quote = line[i];
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < line.len() && line[end] != quote {
+                        end += 1;
+                    }
+                    if end > start && string_count < MAX_STRINGS {
+                        let str_len = (end - start).min(63);
+                        strings_buf[string_count][..str_len]
+                            .copy_from_slice(&line[start..start + str_len]);
+                        string_lens[string_count] = str_len;
+                        string_count += 1;
+                    }
+                    i = end + 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        output[pos..pos + 4].copy_from_slice(&0u32.to_le_bytes());
+        pos += 4;
+
+        output[pos..pos + 4].copy_from_slice(&1u32.to_le_bytes());
+        pos += 4;
+
+        {
+            let main_name = b"main";
+            output[pos..pos + 2].copy_from_slice(&(main_name.len() as u16).to_le_bytes());
+            pos += 2;
+            output[pos..pos + main_name.len()].copy_from_slice(main_name);
+            pos += main_name.len();
+            output[pos..pos + 2].copy_from_slice(&0u16.to_le_bytes());
+            pos += 2;
+            output[pos..pos + 2].copy_from_slice(&0u16.to_le_bytes());
+            pos += 2;
+
+            let mut instr_buf = [0u8; MAX_INSTRUCTIONS * 5];
+            let mut instr_count = 0;
+
+            for li in 0..line_count {
+                let line = &lines_buf[li][..line_lens[li]];
+                let trimmed = core::str::from_utf8(line).unwrap_or("");
+                let trimmed_bytes = trimmed.as_bytes();
+
+                if trimmed_bytes.is_empty() || trimmed_bytes[0] == b'#' {
+                    continue;
+                }
+
+                if trimmed_bytes.starts_with(b"print(") || trimmed_bytes.starts_with(b"println(") {
+                    let is_ln = trimmed_bytes.starts_with(b"println(");
+                    let start = if is_ln { 7 } else { 6 };
+                    let end = trimmed_bytes.len().saturating_sub(1);
+
+                    if end > start && instr_count + 3 < MAX_INSTRUCTIONS {
+                        let inner = &trimmed_bytes[start..end];
+
+                        if (inner.len() >= 2 && inner[0] == b'"' && inner[inner.len() - 1] == b'"')
+                            || (inner.len() >= 2
+                                && inner[0] == b'\''
+                                && inner[inner.len() - 1] == b'\'')
+                        {
+                            let str_start = 1;
+                            let str_end = inner.len() - 1;
+                            let str_content = &inner[str_start..str_end];
+
+                            let mut str_idx = 0;
+                            for si in 0..string_count {
+                                if strings_buf[si][..string_lens[si]]
+                                    == str_content[..str_content.len().min(string_lens[si])]
+                                {
+                                    str_idx = si;
+                                    break;
+                                }
+                            }
+
+                            let off = instr_count * 5;
+                            instr_buf[off] = 1;
+                            instr_buf[off + 1..off + 5].copy_from_slice(&0i32.to_le_bytes());
+
+                            instr_count += 1;
+                            let off = instr_count * 5;
+                            instr_buf[off] = 13;
+                            instr_buf[off + 1..off + 5].copy_from_slice(&(-1i32).to_le_bytes());
+                            instr_count += 1;
+
+                            if is_ln {
+                                let off = instr_count * 5;
+                                instr_buf[off] = 14;
+                                instr_buf[off + 1..off + 5].copy_from_slice(&(-1i32).to_le_bytes());
+                                instr_count += 1;
+                            }
+                        } else if let Ok(num) = core::str::from_utf8(inner)
+                            .unwrap_or("")
+                            .trim()
+                            .parse::<i32>()
+                        {
+                            let off = instr_count * 5;
+                            instr_buf[off] = 1;
+                            instr_buf[off + 1..off + 5].copy_from_slice(&num.to_le_bytes());
+                            instr_count += 1;
+
+                            let off = instr_count * 5;
+                            instr_buf[off] = 13;
+                            instr_buf[off + 1..off + 5].copy_from_slice(&(-1i32).to_le_bytes());
+                            instr_count += 1;
+
+                            if is_ln {
+                                let off = instr_count * 5;
+                                instr_buf[off] = 14;
+                                instr_buf[off + 1..off + 5].copy_from_slice(&(-1i32).to_le_bytes());
+                                instr_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            output[pos..pos + 4].copy_from_slice(&(instr_count as u32).to_le_bytes());
+            pos += 4;
+
+            for i in 0..instr_count {
+                let off = i * 5;
+                output[pos] = instr_buf[off];
+                pos += 1;
+                output[pos..pos + 4].copy_from_slice(&instr_buf[off + 1..off + 5]);
+                pos += 4;
+            }
+        }
+
+        if pos < 20 {
+            return Err(());
+        }
+
+        Ok(pos)
+    }
 }

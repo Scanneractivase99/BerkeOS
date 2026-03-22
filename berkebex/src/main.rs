@@ -2,12 +2,31 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+mod builtins;
+mod codegen;
+mod gui_detector;
+mod import;
+mod ir;
+mod parser;
+
 #[derive(Debug, Clone)]
 pub enum Constant {
     Integer(i32),
     Float(f64),
     String(String),
     Boolean(bool),
+    Dict(Vec<(String, i32)>),
+    Class {
+        name: String,
+        methods: Vec<String>,
+        attributes: Vec<String>,
+        parent: Option<String>,
+    },
+    Object(Vec<(String, i32)>),
+    Lambda {
+        params: Vec<String>,
+        func_idx: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +144,67 @@ impl BytecodeModule {
                     bytes.push(4);
                     bytes.push(*b as u8);
                 }
+                Constant::Dict(entries) => {
+                    bytes.push(5);
+                    bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                    for (key, val_idx) in entries {
+                        let key_bytes = key.as_bytes();
+                        bytes.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+                        bytes.extend_from_slice(key_bytes);
+                        bytes.extend_from_slice(&val_idx.to_le_bytes());
+                    }
+                }
+                Constant::Class {
+                    name,
+                    methods,
+                    attributes,
+                    parent,
+                } => {
+                    bytes.push(6);
+                    let name_bytes = name.as_bytes();
+                    bytes.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                    bytes.extend_from_slice(name_bytes);
+                    bytes.extend_from_slice(&(methods.len() as u32).to_le_bytes());
+                    for method in methods {
+                        let m_bytes = method.as_bytes();
+                        bytes.extend_from_slice(&(m_bytes.len() as u32).to_le_bytes());
+                        bytes.extend_from_slice(m_bytes);
+                    }
+                    bytes.extend_from_slice(&(attributes.len() as u32).to_le_bytes());
+                    for attr in attributes {
+                        let a_bytes = attr.as_bytes();
+                        bytes.extend_from_slice(&(a_bytes.len() as u32).to_le_bytes());
+                        bytes.extend_from_slice(a_bytes);
+                    }
+                    if let Some(p) = parent {
+                        bytes.push(1);
+                        let p_bytes = p.as_bytes();
+                        bytes.extend_from_slice(&(p_bytes.len() as u32).to_le_bytes());
+                        bytes.extend_from_slice(p_bytes);
+                    } else {
+                        bytes.push(0);
+                    }
+                }
+                Constant::Object(fields) => {
+                    bytes.push(7);
+                    bytes.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+                    for (key, val_idx) in fields {
+                        let key_bytes = key.as_bytes();
+                        bytes.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+                        bytes.extend_from_slice(key_bytes);
+                        bytes.extend_from_slice(&val_idx.to_le_bytes());
+                    }
+                }
+                Constant::Lambda { params, func_idx } => {
+                    bytes.push(8);
+                    bytes.extend_from_slice(&(params.len() as u32).to_le_bytes());
+                    for param in params {
+                        let p_bytes = param.as_bytes();
+                        bytes.extend_from_slice(&(p_bytes.len() as u32).to_le_bytes());
+                        bytes.extend_from_slice(p_bytes);
+                    }
+                    bytes.extend_from_slice(&func_idx.to_le_bytes());
+                }
             }
         }
         bytes.extend_from_slice(&(self.functions.len() as u32).to_le_bytes());
@@ -170,6 +250,23 @@ const OP_DUP: u8 = 19;
 const OP_INPUT: u8 = 20;
 const OP_SLEEP: u8 = 21;
 const OP_RANDOM: u8 = 22;
+const OP_CALL: u8 = 23;
+const OP_ARRAY_INDEX: u8 = 27;
+const OP_ARRAY_STORE: u8 = 28;
+const OP_DICT_ACCESS: u8 = 29;
+const OP_DICT_NEW: u8 = 30;
+
+// Exception handling opcodes (match bexvm.rs)
+pub const OP_TRY: u8 = 24;
+pub const OP_CATCH: u8 = 25;
+pub const OP_RAISE: u8 = 26;
+
+// Object/Class opcodes
+pub const OP_NEW: u8 = 31;
+pub const OP_GETATTR: u8 = 32;
+pub const OP_SETATTR: u8 = 33;
+pub const OP_METHOD_CALL: u8 = 34;
+pub const OP_MAKE_OBJECT: u8 = 35;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
@@ -219,6 +316,9 @@ enum Token {
     Semicolon,
     Colon,
     Newline,
+    Dict,
+    Class,
+    Lambda,
     Eof,
 }
 
@@ -321,6 +421,8 @@ impl Lexer {
                 "while" => Token::While,
                 "for" => Token::For,
                 "fn" => Token::Fn,
+                "class" => Token::Class,
+                "lambda" => Token::Lambda,
                 "return" => Token::Return,
                 "true" => Token::True,
                 "false" => Token::False,
@@ -571,6 +673,27 @@ impl Parser {
                 func.emit(OP_RET);
             }
             _ => {
+                if matches!(self.current(), Token::Identifier(_)) {
+                    if let Token::Identifier(ref name) = self.current() {
+                        let name_str = name.clone();
+                        self.advance();
+                        if self.current() == &Token::LBracket {
+                            self.advance();
+                            if let Some(idx) = locals.iter().position(|n| *n == name_str) {
+                                func.emit_op(OP_PUSHLOCAL, idx as i32);
+                            } else {
+                                return Err("Unknown variable for array assignment".to_string());
+                            }
+                            self.parse_expr(func, locals, module)?;
+                            self.advance();
+                            self.advance();
+                            self.parse_expr(func, locals, module)?;
+                            func.emit(OP_ARRAY_STORE);
+                            func.emit(OP_POP);
+                            return Ok(());
+                        }
+                    }
+                }
                 self.parse_expr(func, locals, module)?;
                 func.emit(OP_POP);
             }
@@ -626,6 +749,32 @@ impl Parser {
                 _ => break,
             }
         }
+        Ok(())
+    }
+    fn handle_string_concat(
+        &mut self,
+        func: &mut BytecodeFunction,
+        locals: &mut Vec<String>,
+        module: &mut BytecodeModule,
+        s1: String,
+    ) -> Result<(), String> {
+        let mut result = s1;
+        loop {
+            if self.current() == &Token::Plus {
+                self.advance();
+                if let Token::String(s2) = self.current() {
+                    let s2 = s2.clone();
+                    self.advance();
+                    result.push_str(&s2);
+                } else {
+                    return Err("String concat requires string operand".to_string());
+                }
+            } else {
+                break;
+            }
+        }
+        let const_idx = module.add_constant(Constant::String(result));
+        func.emit_op(OP_PUSH, const_idx as i32);
         Ok(())
     }
     fn parse_factor(
@@ -688,7 +837,11 @@ impl Parser {
                 let _ = func.emit_op(OP_PUSH, module.add_constant(Constant::Float(f)) as i32);
             }
             Token::String(s) => {
-                let _ = func.emit_op(OP_PUSH, module.add_constant(Constant::String(s)) as i32);
+                if self.current() == &Token::Plus {
+                    self.handle_string_concat(func, locals, module, s)?;
+                } else {
+                    let _ = func.emit_op(OP_PUSH, module.add_constant(Constant::String(s)) as i32);
+                }
             }
             Token::True => {
                 let _ = func.emit_op(OP_PUSH, module.add_constant(Constant::Boolean(true)) as i32);
@@ -698,6 +851,16 @@ impl Parser {
                     OP_PUSH,
                     module.add_constant(Constant::Boolean(false)) as i32,
                 );
+            }
+            Token::LBrace => {
+                let entries = self.parse_dict_entries(func, locals, module)?;
+                let const_idx = module.add_constant(Constant::Dict(entries));
+                func.emit_op(OP_PUSH, const_idx as i32);
+            }
+            Token::LBracket => {
+                self.parse_expr(func, locals, module)?;
+                self.advance();
+                func.emit(OP_ARRAY_INDEX);
             }
             Token::Identifier(name) => {
                 if self.current() == &Token::LParen {
@@ -734,9 +897,43 @@ impl Parser {
                             func.emit_op(OP_SYSCALL, 2);
                         }
                         _ => {
-                            func.emit(OP_SYSCALL);
-                            func.emit_op(OP_SYSCALL, 0);
+                            if let Some(func_idx) =
+                                module.functions.iter().position(|f| f.name == name)
+                            {
+                                func.emit_op(OP_CALL, func_idx as i32);
+                            } else {
+                                func.emit(OP_SYSCALL);
+                                func.emit_op(OP_SYSCALL, 0);
+                            }
                         }
+                    }
+                } else if self.current() == &Token::LBracket {
+                    if let Some(idx) = locals.iter().position(|n| n == &name) {
+                        func.emit_op(OP_PUSHLOCAL, idx as i32);
+                    } else {
+                        func.emit_op(OP_PUSH, module.add_constant(Constant::Integer(0)) as i32);
+                    }
+                    self.advance();
+                    if matches!(self.current(), Token::String(_)) {
+                        if let Token::String(ref s) = self.current() {
+                            let key_idx = module.add_constant(Constant::String(s.clone()));
+                            self.advance();
+                            if self.current() == &Token::RBracket {
+                                self.advance();
+                                let const_idx = module.add_constant(Constant::Integer(0));
+                                func.emit_op(OP_PUSH, const_idx as i32);
+                                func.emit_op(OP_PUSH, key_idx as i32);
+                                func.emit(OP_DICT_ACCESS);
+                            } else {
+                                return Err("Expected ']'".to_string());
+                            }
+                        } else {
+                            return Err("Dict key must be string".to_string());
+                        }
+                    } else {
+                        self.parse_expr(func, locals, module)?;
+                        self.advance();
+                        func.emit(OP_ARRAY_INDEX);
                     }
                 } else if let Some(idx) = locals.iter().position(|n| n == &name) {
                     func.emit_op(OP_PUSHLOCAL, idx as i32);
@@ -751,6 +948,76 @@ impl Parser {
             _ => return Err(format!("Unexpected: {:?}", tok)),
         }
         Ok(())
+    }
+    fn parse_dict_entries(
+        &mut self,
+        func: &mut BytecodeFunction,
+        locals: &mut Vec<String>,
+        module: &mut BytecodeModule,
+    ) -> Result<Vec<(String, i32)>, String> {
+        let mut entries = Vec::new();
+        while !matches!(self.current(), Token::RBrace) && !matches!(self.current(), Token::Eof) {
+            if matches!(self.current(), Token::Newline) {
+                self.advance();
+                continue;
+            }
+            let key = match self.current().clone() {
+                Token::String(s) => {
+                    self.advance();
+                    s
+                }
+                Token::Identifier(name) => {
+                    self.advance();
+                    name
+                }
+                _ => return Err("Expected string or identifier for dict key".to_string()),
+            };
+            self.advance();
+            let val_const_idx = self.parse_simple_constant(func, &locals, module)?;
+            entries.push((key, val_const_idx));
+            if matches!(self.current(), Token::Comma) {
+                self.advance();
+            }
+        }
+        if !matches!(self.current(), Token::RBrace) {
+            return Err("Expected '}'".to_string());
+        }
+        self.advance();
+        Ok(entries)
+    }
+    fn parse_simple_constant(
+        &mut self,
+        func: &mut BytecodeFunction,
+        _locals: &[String],
+        module: &mut BytecodeModule,
+    ) -> Result<i32, String> {
+        match self.current() {
+            Token::Number(n) => {
+                let idx = module.add_constant(Constant::Integer(*n));
+                self.advance();
+                let _ = func.emit_op(OP_PUSH, idx as i32);
+                Ok(idx as i32)
+            }
+            Token::String(s) => {
+                let idx = module.add_constant(Constant::String(s.clone()));
+                self.advance();
+                let _ = func.emit_op(OP_PUSH, idx as i32);
+                Ok(idx as i32)
+            }
+            Token::True => {
+                let idx = module.add_constant(Constant::Boolean(true));
+                self.advance();
+                let _ = func.emit_op(OP_PUSH, idx as i32);
+                Ok(idx as i32)
+            }
+            Token::False => {
+                let idx = module.add_constant(Constant::Boolean(false));
+                self.advance();
+                let _ = func.emit_op(OP_PUSH, idx as i32);
+                Ok(idx as i32)
+            }
+            _ => Err("Dict values must be constant (number, string, boolean)".to_string()),
+        }
     }
 }
 
@@ -773,9 +1040,138 @@ pub fn compile(source: &str, name: &str) -> Result<BytecodeModule, String> {
 fn print_usage() {
     println!("BerkeBex v0.2 - BerkeOS Executable Compiler");
     println!("Usage: berkebex compile <input> [-o <output.bex>]");
+    println!("       berkebex --python <input.py> [-o <output.bex>] [--verbose]");
     println!("       berkebex info <file.bex>");
+    println!("       berkebex parse [-s <source>] | <file>");
     println!("Languages: .bepy (Python subset) | .c (C subset)");
     println!("Functions: print(), println(), input(), sleep(), rand()");
+    println!("Options: --no-gui-guard  Disable GUI framework runtime hooks");
+}
+
+fn check_gui_warnings(source: &str, verbose: bool) {
+    let patterns = [
+        ("tkinter", "Tkinter GUI not supported in BerkeOS"),
+        ("pygame", "Pygame not supported in BerkeOS"),
+        ("pyqt", "PyQt not supported in BerkeOS"),
+        ("pyside", "PySide not supported in BerkeOS"),
+        ("wxpython", "wxPython not supported in BerkeOS"),
+        ("gtk", "GTK not supported in BerkeOS"),
+        ("matplotlib", "matplotlib GUI not supported in BerkeOS"),
+        ("turtle", "turtle graphics not supported in BerkeOS"),
+        ("cv2", "OpenCV GUI not supported in BerkeOS"),
+    ];
+
+    let lower = source.to_lowercase();
+    for (pattern, msg) in patterns {
+        if lower.contains(pattern) {
+            eprintln!("Warning: {}", msg);
+            if verbose {
+                eprintln!("  (Hint: Remove '{}' for BerkeOS compatibility)", pattern);
+            }
+        }
+    }
+}
+
+/// Compile Python source to .bex bytecode using the full pipeline
+fn compile_python(input_file: &str, output_file: &str, verbose: bool) -> Result<(), String> {
+    // Step 1: Read source
+    if verbose {
+        eprintln!("[VERBOSE] Reading source from: {}", input_file);
+    }
+    let source =
+        fs::read_to_string(input_file).map_err(|e| format!("Failed to read file: {}", e))?;
+
+    // Step 2: Check for GUI patterns
+    if verbose {
+        eprintln!("[VERBOSE] Checking for unsupported GUI patterns...");
+    }
+    check_gui_warnings(&source, verbose);
+
+    // Step 3: Parse Python source with rustpython-parser
+    if verbose {
+        eprintln!("[VERBOSE] Parsing Python source...");
+    }
+    let ast = parser::parse_python(&source).map_err(|e| format!("Parse error: {}", e))?;
+    if verbose {
+        eprintln!("[VERBOSE] Parsed {} statements", ast.len());
+    }
+
+    // Step 4: Convert AST to IR
+    if verbose {
+        eprintln!("[VERBOSE] Converting AST to IR...");
+    }
+    let name = Path::new(input_file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("program");
+    let ir_module = ir::ast_to_ir(&ast, name).map_err(|e| format!("IR conversion error: {}", e))?;
+    if verbose {
+        eprintln!(
+            "[VERBOSE] IR module has {} functions",
+            ir_module.functions.len()
+        );
+    }
+
+    // Step 5: Generate bytecode
+    if verbose {
+        eprintln!("[VERBOSE] Generating bytecode...");
+    }
+    let bytecode_module = codegen::ir_to_bex(&ir_module);
+
+    // Step 6: Emit .bex binary
+    if verbose {
+        eprintln!("[VERBOSE] Emitting .bex binary...");
+    }
+    let bytes = bytecode_module.emit_bex();
+    if verbose {
+        eprintln!("[VERBOSE] Generated {} bytes", bytes.len());
+    }
+
+    // Step 7: Write output file
+    if verbose {
+        eprintln!("[VERBOSE] Writing to: {}", output_file);
+    }
+    fs::write(output_file, &bytes).map_err(|e| format!("Failed to write output: {}", e))?;
+
+    Ok(())
+}
+
+fn parse_python_source(source: &str) -> Result<(), String> {
+    match parser::parse_python(source) {
+        Ok(suite) => {
+            println!("Parse successful!");
+            println!("Statements: {}", suite.len());
+            Ok(())
+        }
+        Err(e) => Err(format!("{}", e)),
+    }
+}
+
+fn handle_parse(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: berkebex parse [-s <source>] | <file>");
+        return;
+    }
+
+    if args[0] == "-s" {
+        if args.len() < 2 {
+            eprintln!("Error: -s requires source argument");
+            return;
+        }
+        match parse_python_source(&args[1]) {
+            Ok(_) => {}
+            Err(e) => eprintln!("Error: {}", e),
+        }
+    } else {
+        let file = &args[0];
+        match fs::read_to_string(file) {
+            Ok(source) => match parse_python_source(&source) {
+                Ok(_) => {}
+                Err(e) => eprintln!("Error: {}", e),
+            },
+            Err(e) => eprintln!("Error reading file: {}", e),
+        }
+    }
 }
 
 fn compile_file(input_file: &str) -> Result<Vec<u8>, String> {
@@ -814,6 +1210,32 @@ fn print_info(file: &str) -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        print_usage();
+        return;
+    }
+
+    if args[1] == "--python" {
+        if args.len() < 3 {
+            eprintln!("Error: --python requires an input file");
+            print_usage();
+            return;
+        }
+        let input = &args[2];
+        let verbose = args.contains(&"--verbose".to_string()) || args.contains(&"-v".to_string());
+        let no_gui_guard = args.contains(&"--no-gui-guard".to_string());
+        if no_gui_guard {
+            eprintln!("Note: GUI checks disabled");
+        }
+        let output = extract_output_file(&args, "--python");
+
+        match compile_python(input, &output, verbose) {
+            Ok(()) => println!("{} -> {}", input, output),
+            Err(e) => eprintln!("Error: {}", e),
+        }
+        return;
+    }
+
     if args.len() < 3 {
         print_usage();
         return;
@@ -821,6 +1243,10 @@ fn main() {
     match args[1].as_str() {
         "compile" | "c" => {
             let input = &args[2];
+            let no_gui_guard = args.contains(&"--no-gui-guard".to_string());
+            if no_gui_guard {
+                eprintln!("Note: GUI checks disabled");
+            }
             let output = if args.len() > 4 && args[3] == "-o" {
                 args[4].clone()
             } else {
@@ -846,10 +1272,39 @@ fn main() {
                 print_usage();
             }
         }
+        "parse" => {
+            handle_parse(&args[2..]);
+        }
         "help" | "-h" | "--help" => print_usage(),
         _ => {
             eprintln!("Unknown: {}", args[1]);
             print_usage();
         }
+    }
+}
+
+fn extract_output_file(args: &[String], mode: &str) -> String {
+    let mut found_o = false;
+    for arg in args.iter().skip(1) {
+        if found_o {
+            return arg.clone();
+        }
+        if arg == "-o" {
+            found_o = true;
+        }
+    }
+    match mode {
+        "--python" => {
+            let input_idx = args.iter().position(|a| a == "--python").unwrap_or(1);
+            let input = args
+                .get(input_idx + 1)
+                .map(|s| s.as_str())
+                .unwrap_or("program");
+            format!(
+                "{}.bex",
+                Path::new(input).file_stem().unwrap().to_str().unwrap()
+            )
+        }
+        _ => "a.out".to_string(),
     }
 }
